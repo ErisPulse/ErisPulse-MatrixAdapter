@@ -82,24 +82,35 @@ await matrix.Send.To("group", room_id).Raw_ob12(message)
 
 ### 配置说明
 
-首次运行会自动生成默认配置。
+首次运行会自动生成默认配置。MatrixAdapter 支持多账户配置。
 
 ```toml
 # config.toml
-[Matrix_Adapter]
+# 账户1
+[Matrix_Adapter.accounts.default]
 homeserver = "https://matrix.org"          # Matrix服务器地址（必填）
 access_token = "YOUR_ACCESS_TOKEN"          # 访问令牌（与 user_id+password 二选一）
 user_id = ""                                # Matrix用户ID（如 @bot:matrix.org）
 password = ""                               # Matrix用户密码
 auto_accept_invites = true                  # 是否自动接受房间邀请（可选，默认为true）
+enabled = true                              # 是否启用（可选，默认为true）
+
+# 账户2
+[Matrix_Adapter.accounts.bot2]
+homeserver = "https://matrix.example.com"
+access_token = "ANOTHER_TOKEN"
+enabled = true
 ```
 
-**配置项说明：**
+> 兼容旧配置：若检测到旧的单账户 `[Matrix_Adapter]` 配置（含 access_token），会自动迁移为 `accounts.default`。
+
+**配置项说明（每个账户）：**
 - `homeserver`：Matrix服务器地址（必填），默认为 `https://matrix.org`
 - `access_token`：访问令牌，可从Matrix客户端（如 Element）的设置中获取
 - `user_id`：Matrix用户ID（如 `@bot:matrix.org`），与 `password` 配合使用
 - `password`：Matrix用户密码，用于自动登录获取 access_token
 - `auto_accept_invites`：是否自动接受房间邀请，默认为 `true`
+- `enabled`：是否启用该账户（可选，默认为true）
 
 **认证方式：**
 - 方式一（推荐）：直接提供 `access_token`
