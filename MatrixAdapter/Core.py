@@ -433,8 +433,27 @@ class MatrixAdapter(BaseAdapter):
                 raise
 
     async def _sync_loop(self, account_name: str):
-        await self._initial_sync(account_name)
+        account = self.accounts.get(account_name)
+        max_failures = 5
+
+        # 初始同步——如果认证失败，尝试重新登录后重试
+        if not await self._initial_sync(account_name):
+            if not await self._try_relogin(account_name, account):
+                self.logger.error(
+                    f"账户 {account_name} 初始同步失败且无法重新登录，停止同步"
+                )
+                await self._on_sync_loop_exit(account_name)
+                return
+            if not await self._initial_sync(account_name):
+                self.logger.error(
+                    f"账户 {account_name} 重新登录后初始同步仍失败，停止同步"
+                )
+                await self._on_sync_loop_exit(account_name)
+                return
+
         await self._discover_dm_rooms(account_name)
+
+        consecutive_failures = 0
 
         while self._running:
             try:
@@ -446,12 +465,44 @@ class MatrixAdapter(BaseAdapter):
                 )
 
                 if result.get("status") != "ok":
-                    self.logger.error(
-                        f"账户 {account_name} 同步失败: {result.get('message')}"
+                    message = result.get("message", "")
+                    http_status = result.get("http_status", 0)
+                    is_auth_error = (
+                        http_status in (401, 403)
+                        or "authorization" in message.lower()
+                        or "token" in message.lower()
                     )
-                    await asyncio.sleep(5)
+
+                    if is_auth_error:
+                        consecutive_failures += 1
+                        self.logger.warning(
+                            f"账户 {account_name} 认证失败 ({consecutive_failures}/{max_failures}): {message}"
+                        )
+                        if await self._try_relogin(account_name, account):
+                            self.logger.info(
+                                f"账户 {account_name} 重新登录成功，继续同步"
+                            )
+                            consecutive_failures = 0
+                            continue
+                    else:
+                        consecutive_failures += 1
+                        self.logger.error(
+                            f"账户 {account_name} 同步失败 ({consecutive_failures}/{max_failures}): {message}"
+                        )
+
+                    if consecutive_failures >= max_failures:
+                        self.logger.error(
+                            f"账户 {account_name} 连续 {max_failures} 次失败，停止同步循环"
+                        )
+                        break
+
+                    # 指数退避: 5, 10, 20, 40, 60
+                    backoff = min(5 * (2 ** (consecutive_failures - 1)), 60)
+                    await asyncio.sleep(backoff)
                     continue
 
+                # 成功——重置计数器
+                consecutive_failures = 0
                 data = result.get("data", {})
                 runtime["_next_batch"] = data.get(
                     "next_batch", runtime.get("_next_batch")
@@ -463,9 +514,54 @@ class MatrixAdapter(BaseAdapter):
                 break
             except Exception as e:
                 self.logger.error(f"账户 {account_name} 同步循环异常: {e}")
-                await asyncio.sleep(5)
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    self.logger.error(
+                        f"账户 {account_name} 连续 {max_failures} 次异常，停止同步循环"
+                    )
+                    break
+                await asyncio.sleep(min(5 * consecutive_failures, 30))
 
-    async def _initial_sync(self, account_name: str):
+        await self._on_sync_loop_exit(account_name)
+
+    async def _try_relogin(self, account_name: str, account) -> bool:
+        """尝试重新登录。成功返回 True，失败或无凭据返回 False。"""
+        if not account or not account.user_id or not account.password:
+            return False
+        try:
+            self.logger.info(f"账户 {account_name} 尝试重新登录...")
+            # 清空旧 token，强制走密码登录路径
+            old_token = account.access_token
+            account.access_token = ""
+            try:
+                await self._login_if_needed(account_name, account)
+            except Exception:
+                # 恢复旧 token，避免状态污染
+                account.access_token = old_token
+                raise
+            self.logger.info(f"账户 {account_name} 重新登录成功")
+            return True
+        except Exception as e:
+            self.logger.error(f"账户 {account_name} 重新登录失败: {e}")
+            return False
+
+    async def _on_sync_loop_exit(self, account_name: str):
+        """同步循环因错误退出时清理状态"""
+        if not self._running:
+            return
+        runtime = self._get_runtime(account_name)
+        bot_id = runtime.get("bot_id", "")
+        if bot_id:
+            try:
+                await self.emit_meta("disconnect", bot_id)
+            except Exception:
+                pass
+        # 停止该账户的心跳任务
+        task = self._heartbeat_meta_tasks.pop(account_name, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _initial_sync(self, account_name: str) -> bool:
         runtime = self._get_runtime(account_name)
         result = await self.call_api(
             endpoint="/_matrix/client/v3/sync?timeout=0",
@@ -478,6 +574,12 @@ class MatrixAdapter(BaseAdapter):
             self.logger.info(
                 f"账户 {account_name} 初始同步完成, next_batch: {runtime.get('_next_batch')}"
             )
+            return True
+        else:
+            self.logger.warning(
+                f"账户 {account_name} 初始同步失败: {result.get('message', 'Unknown error')}"
+            )
+            return False
 
     async def _discover_dm_rooms(self, account_name: str):
         runtime = self._get_runtime(account_name)
@@ -644,6 +746,7 @@ class MatrixAdapter(BaseAdapter):
                     raw=raw_response,
                 )
                 response["matrix_raw"] = raw_response
+                response["http_status"] = resp.status
                 if echo:
                     response["echo"] = echo
                 return response
@@ -664,6 +767,7 @@ class MatrixAdapter(BaseAdapter):
                 raw=raw_response,
             )
             response["matrix_raw"] = raw_response
+            response["http_status"] = resp.status
             if echo:
                 response["echo"] = echo
             return response
