@@ -1,4 +1,226 @@
-# MatrixAdapter 模块文档
+# ErisPulse Matrix Adapter
+
+[English](#english) | [中文](#中文)
+
+---
+
+<a id="english"></a>
+
+## English
+
+A Matrix protocol adapter built on the [ErisPulse](https://github.com/ErisPulse/ErisPulse/) framework. It receives events via the Long Polling Sync API and integrates modules for multiple scenarios such as private chats and groups, providing a unified interface for event handling and message operations.
+
+### Usage Examples
+
+#### OneBot12 Standard Event Types
+
+The MatrixAdapter is fully compatible with the OneBot12 standard event format, with some extension fields:
+
+| Event Type | detail_type | Description |
+|------------|-------------|-------------|
+| Message (Private) | private | A message sent by a user in a DM room |
+| Message (Group) | group | A message sent by a user in a group room |
+| Group Member Increase | group_member_increase | A user joined the room |
+| Group Member Decrease | group_member_decrease | A user left or was banned |
+| Member Info Update | matrix_member_update | Room member information changed |
+| Matrix Reaction | matrix_reaction | A reaction to a message |
+| Matrix Redaction | matrix_redaction | A message was redacted/deleted |
+| Matrix Room Name Change | matrix_name | The room name changed |
+| Matrix Room Topic Change | matrix_topic | The room topic changed |
+| Matrix Room Avatar Change | matrix_avatar | The room avatar changed |
+| Matrix Power Levels Change | matrix_power_levels | Room permissions changed |
+
+---
+
+### Sending Messages
+
+```python
+from ErisPulse import sdk
+matrix = sdk.adapter.get("matrix")
+
+# Send a text message
+await matrix.Send.To("group", room_id).Text("Hello World!")
+
+# Send a message with @mention
+await matrix.Send.To("group", room_id).At("@user:matrix.org").Text("Hello")
+
+# Send a message mentioning everyone
+await matrix.Send.To("group", room_id).AtAll().Text("Announcement")
+
+# Send a reply message
+await matrix.Send.To("group", room_id).Reply("$event_id").Text("Reply content")
+
+# Send an image (URL)
+await matrix.Send.To("group", room_id).Image("https://example.com/image.png")
+
+# Send an image (MXC URI)
+await matrix.Send.To("group", room_id).Image("mxc://matrix.org/abc123")
+
+# Send an image (binary data)
+with open("image.png", "rb") as f:
+    image_data = f.read()
+await matrix.Send.To("group", room_id).Image(image_data)
+
+# Send an image (local file path)
+await matrix.Send.To("group", room_id).Image("/path/to/image.png")
+
+# Send a notice message (m.notice)
+await matrix.Send.To("group", room_id).Notice("System notice")
+
+# Send an HTML-formatted message
+await matrix.Send.To("group", room_id).Html("<b>bold</b> <i>italic</i>", fallback="bold italic")
+
+# Send a file (with filename)
+await matrix.Send.To("group", room_id).File("/path/to/file.pdf", filename="document.pdf")
+
+# Combined usage: reply + mention
+await matrix.Send.To("group", room_id).Reply("$event_id").At("@user:matrix.org").Text("Composite message")
+
+# Send a OneBot12-format message using Raw_ob12
+message = [
+    {"type": "text", "data": {"text": "First line"}},
+    {"type": "image", "data": {"file": "https://example.com/img.jpg"}},
+    {"type": "text", "data": {"text": "Second line"}}
+]
+await matrix.Send.To("group", room_id).Raw_ob12(message)
+```
+
+---
+
+### Configuration
+
+A default configuration is generated automatically on first run. MatrixAdapter supports multi-account configuration.
+
+```toml
+# config.toml
+# Account 1
+[Matrix_Adapter.accounts.default]
+homeserver = "https://matrix.org"          # Matrix server address (required)
+access_token = "YOUR_ACCESS_TOKEN"          # Access token (one of access_token or user_id+password)
+user_id = ""                                # Matrix user ID (e.g. @bot:matrix.org)
+password = ""                               # Matrix user password
+auto_accept_invites = true                  # Whether to auto-accept room invites (optional, default true)
+enabled = true                              # Whether to enable (optional, default true)
+
+# Account 2
+[Matrix_Adapter.accounts.bot2]
+homeserver = "https://matrix.example.com"
+access_token = "ANOTHER_TOKEN"
+enabled = true
+```
+
+> Backward compatibility: If an old single-account `[Matrix_Adapter]` configuration (containing access_token) is detected, it will be automatically migrated to `accounts.default`.
+
+**Configuration fields (per account):**
+- `homeserver`: Matrix server address (required), defaults to `https://matrix.org`
+- `access_token`: Access token, obtainable from a Matrix client (e.g. Element) settings
+- `user_id`: Matrix user ID (e.g. `@bot:matrix.org`), used together with `password`
+- `password`: Matrix user password, used for auto-login to obtain an access_token
+- `auto_accept_invites`: Whether to auto-accept room invites, defaults to `true`
+- `enabled`: Whether to enable this account (optional, default true)
+
+**Authentication methods:**
+- Method 1 (recommended): Provide `access_token` directly
+- Method 2: Provide `user_id` and `password`; the adapter will call the login API to obtain a token automatically
+
+---
+
+### Matrix-Specific Features
+
+See the [Matrix platform features documentation](platform-features.md) for platform-specific capabilities, including the decentralized architecture, room concepts, Long Polling sync, MXC URIs, HTML rich text, reactions, message editing, and extension field descriptions.
+
+For the detailed event conversion reference, see the [conversion mapping documentation](CoverToOnebot12.md).
+
+### Event Listening Examples
+
+#### Using the Event Module (Recommended)
+
+```python
+from ErisPulse.Core.Event import message, notice
+
+@message.on_message()
+async def handle_message(event):
+    if event["platform"] == "matrix":
+        detail_type = event["detail_type"]
+        if detail_type == "private":
+            # Handle private message
+            pass
+        elif detail_type == "group":
+            # Handle group message
+            pass
+
+@notice.on_notice()
+async def handle_notice(event):
+    if event["platform"] == "matrix":
+        detail_type = event["detail_type"]
+        if detail_type == "matrix_reaction":
+            # Handle reaction
+            reaction_key = event.get("matrix_reaction_key", "")
+        elif detail_type == "matrix_redaction":
+            # Handle message redaction
+            redacted_id = event.get("matrix_redacted_event_id", "")
+        elif detail_type == "group_member_increase":
+            # Handle member join
+            user_id = event.get("user_id", "")
+```
+
+#### Using OneBot12 Standard Events
+
+```python
+@sdk.adapter.on("message")
+async def handle_message(event):
+    if event["platform"] == "matrix":
+        bot_id = event["self"]["user_id"]
+        print(f"Message from Bot: {bot_id}")
+
+@sdk.adapter.on("notice")
+async def handle_notice(event):
+    if event["platform"] == "matrix":
+        # Handle Matrix notice event
+        pass
+```
+
+#### Using Event Mixin Methods
+
+```python
+@message.on_message()
+async def handle_message(event):
+    if event.get("platform") != "matrix":
+        return
+
+    room_id = event.get_room_id()               # Get the room ID
+    event_type = event.get_matrix_event_type()  # Get the raw Matrix event type
+    sender = event.get_matrix_sender()          # Get the sender ID
+    is_edited = event.is_edited()               # Whether the message is an edit
+    is_notice = event.is_notice()               # Whether it is an m.notice type
+```
+
+### Notes
+
+1. Make sure all handlers are registered before calling `startup()`.
+2. Matrix is a decentralized protocol. User IDs use the format `@user:server.domain`, and room IDs use the format `!room_id:server.domain`.
+3. Matrix does not distinguish between group chats and private chats — all conversations are "rooms". The adapter identifies private chats via DM account data automatically.
+4. The adapter uses Long Polling (the `/sync` API) to receive events, not WebSocket.
+5. Media files are referenced via `mxc://` URIs; the adapter supports automatic upload and download.
+6. Call `shutdown()` on program exit to ensure resources are released.
+7. Auto-accepting room invites is supported (can be disabled via the `auto_accept_invites` config).
+8. HTML-formatted messages are supported via the `.Html()` method.
+9. Message replies (`.Reply()`) and user mentions (`.At()`, `.AtAll()`) are supported.
+
+---
+
+### Reference Links
+
+- [ErisPulse Main Repository](https://github.com/ErisPulse/ErisPulse/)
+- [Matrix Protocol Specification](https://spec.matrix.org/)
+- [Matrix Client-Server API](https://spec.matrix.org/v1.11/client-server-api/)
+- [Module Development Guide](https://www.erisdev.com/#docs/developer-guide/README.md)
+
+---
+
+<a id="中文"></a>
+
+## 中文
 
 ## 简介
 MatrixAdapter 是基于 [ErisPulse](https://github.com/ErisPulse/ErisPulse/) 架构的 Matrix 协议适配器，通过 Long Polling Sync API 接收事件，整合了私聊、群组等多种场景的功能模块，提供统一的事件处理和消息操作接口。
