@@ -21,7 +21,7 @@ class MatrixAccountConfig(BotAccountConfig):
     homeserver: str = field(
         default="https://matrix.org",
         metadata={
-            "description": "Matrix 服务器地址",
+            "description": "Matrix server address",
             "required": True,
             "webui": {"widget": "text", "group": "connection", "order": 1},
         },
@@ -29,7 +29,7 @@ class MatrixAccountConfig(BotAccountConfig):
     access_token: str = field(
         default="",
         metadata={
-            "description": "访问令牌（与 user_id/password 二选一）",
+            "description": "Access token (alternative to user_id/password)",
             "secret": True,
             "webui": {"widget": "password", "group": "basic", "order": 2},
         },
@@ -37,14 +37,14 @@ class MatrixAccountConfig(BotAccountConfig):
     user_id: str = field(
         default="",
         metadata={
-            "description": "用户名（密码登录时填写）",
+            "description": "Username (used for password login)",
             "webui": {"widget": "text", "group": "basic", "order": 3},
         },
     )
     password: str = field(
         default="",
         metadata={
-            "description": "密码（密码登录时填写）",
+            "description": "Password (used for password login)",
             "secret": True,
             "webui": {"widget": "password", "group": "basic", "order": 4},
         },
@@ -52,7 +52,7 @@ class MatrixAccountConfig(BotAccountConfig):
     auto_accept_invites: bool = field(
         default=True,
         metadata={
-            "description": "是否自动接受房间邀请",
+            "description": "Automatically accept room invitations",
             "webui": {"widget": "switch", "group": "behavior", "order": 5},
         },
     )
