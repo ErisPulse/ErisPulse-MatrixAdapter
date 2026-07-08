@@ -9,6 +9,7 @@ from ErisPulse.Core import client
 from ErisPulse.Core.Bases.adapter import BaseAdapter
 from ErisPulse.Core.Event import register_event_mixin, unregister_platform_event_methods
 from ErisPulse.runtime.config_schema import BotAccountConfig
+from ErisPulse.Core.i18n import i18n
 
 from .Converter import MatrixConverter
 
@@ -21,41 +22,55 @@ class MatrixAccountConfig(BotAccountConfig):
     homeserver: str = field(
         default="https://matrix.org",
         metadata={
-            "description": "Matrix server address",
+            "description": {"i18n": "matrix.homeserver", "default": "Matrix 服务器地址"},
             "required": True,
-            "webui": {"widget": "text", "group": "connection", "order": 1},
+            "ui": {
+                "widget": "text",
+                "group": "connection",
+                "order": 1,
+                "placeholder": {"i18n": "matrix.homeserver.ph", "default": "https://matrix.org"},
+            },
         },
     )
     access_token: str = field(
         default="",
         metadata={
-            "description": "Access token (alternative to user_id/password)",
+            "description": {"i18n": "matrix.access_token", "default": "Access Token（替代 user_id/password）"},
             "secret": True,
-            "webui": {"widget": "password", "group": "basic", "order": 2},
+            "ui": {"widget": "password", "group": "basic", "order": 2},
         },
     )
     user_id: str = field(
         default="",
         metadata={
-            "description": "Username (used for password login)",
-            "webui": {"widget": "text", "group": "basic", "order": 3},
+            "description": {"i18n": "matrix.user_id", "default": "用户名（用于密码登录）"},
+            "ui": {"widget": "text", "group": "basic", "order": 3},
         },
     )
     password: str = field(
         default="",
         metadata={
-            "description": "Password (used for password login)",
+            "description": {"i18n": "matrix.password", "default": "密码（用于密码登录）"},
             "secret": True,
-            "webui": {"widget": "password", "group": "basic", "order": 4},
+            "ui": {"widget": "password", "group": "basic", "order": 4},
         },
     )
     auto_accept_invites: bool = field(
         default=True,
         metadata={
-            "description": "Automatically accept room invitations",
-            "webui": {"widget": "switch", "group": "behavior", "order": 5},
+            "description": {"i18n": "matrix.auto_accept_invites", "default": "自动接受房间邀请"},
+            "ui": {"widget": "switch", "group": "behavior", "order": 5},
         },
     )
+
+
+MatrixAccountConfig._schema_meta = {
+    "group_labels": {
+        "basic": {"i18n": "matrix.group.basic", "default": "基本设置"},
+        "connection": {"i18n": "matrix.group.connection", "default": "连接设置"},
+        "behavior": {"i18n": "matrix.group.behavior", "default": "行为设置"},
+    }
+}  # type: ignore[attr-defined]
 
 
 # ============================================================================
@@ -316,6 +331,120 @@ class MatrixAdapter(BaseAdapter):
         self._heartbeat_meta_tasks: Dict[str, asyncio.Task] = {}
         self._converters: Dict[str, MatrixConverter] = {}
         self._running = False
+        self._register_i18n()
+
+    def _register_i18n(self):
+        """注册配置字段与日志消息的 i18n 翻译"""
+        try:
+            from ErisPulse.runtime.config_schema import register_config_i18n
+            register_config_i18n(MatrixAccountConfig, "zh-CN", domain="matrix")
+            register_config_i18n(MatrixAccountConfig, "en", {
+                "matrix.homeserver": "Matrix server address",
+                "matrix.homeserver.ph": "https://matrix.org",
+                "matrix.access_token": "Access Token (alternative to user_id/password)",
+                "matrix.user_id": "Username (used for password login)",
+                "matrix.password": "Password (used for password login)",
+                "matrix.auto_accept_invites": "Automatically accept room invitations",
+                "matrix.group.basic": "Basic",
+                "matrix.group.connection": "Connection",
+                "matrix.group.behavior": "Behavior",
+            }, domain="matrix")
+        except Exception:
+            pass
+
+        zh_CN = {
+            "matrix.old_config_detected": "检测到旧格式单账户配置，建议迁移到 Matrix_Adapter.accounts.default",
+            "matrix.save_default_failed": "保存默认配置失败: {error}",
+            "matrix.missing_credentials": "账户 '{name}' 缺少 access_token/user_id，已跳过",
+            "matrix.account_disabled": "账户 '{name}' 已加载但未启用（enabled=false），请在配置中将 [Matrix_Adapter.accounts.{name}] 的 enabled 设为 true",
+            "matrix.accounts_loaded": "Matrix适配器初始化完成，共加载 {count} 个账户",
+            "matrix.authenticated": "账户 {name} Matrix 已认证: {bot_id}",
+            "matrix.login_success": "账户 {name} Matrix 登录成功: {bot_id}",
+            "matrix.login_failed": "登录失败: {message}",
+            "matrix.login_error": "账户 {name} Matrix 登录失败: {error}",
+            "matrix.initial_sync_failed_nologin": "账户 {name} 初始同步失败且无法重新登录，停止同步",
+            "matrix.initial_sync_still_failed": "账户 {name} 重新登录后初始同步仍失败，停止同步",
+            "matrix.auth_failed": "账户 {name} 认证失败 ({count}/{max}): {message}",
+            "matrix.relogin_success": "账户 {name} 重新登录成功，继续同步",
+            "matrix.sync_failed": "账户 {name} 同步失败 ({count}/{max}): {message}",
+            "matrix.max_failures_stop": "账户 {name} 连续 {max} 次失败，停止同步循环",
+            "matrix.sync_loop_error": "账户 {name} 同步循环异常: {error}",
+            "matrix.max_exceptions_stop": "账户 {name} 连续 {max} 次异常，停止同步循环",
+            "matrix.relogin_attempt": "账户 {name} 尝试重新登录...",
+            "matrix.relogin_done": "账户 {name} 重新登录成功",
+            "matrix.relogin_failed": "账户 {name} 重新登录失败: {error}",
+            "matrix.initial_sync_done": "账户 {name} 初始同步完成, next_batch: {batch}",
+            "matrix.initial_sync_failed": "账户 {name} 初始同步失败: {message}",
+            "matrix.dm_discovered": "账户 {name} 发现 {count} 个 DM 房间",
+            "matrix.process_event": "账户 {name} 处理 Matrix 事件: {event}",
+            "matrix.process_event_failed": "处理事件失败: {error}",
+            "matrix.room_invite": "账户 {name} 收到房间邀请: {room}",
+            "matrix.room_joined": "账户 {name} 已自动加入房间: {room}",
+            "matrix.join_room_failed": "加入房间失败: {error}",
+            "matrix.download_failed": "账户 {name} 下载文件失败: HTTP {status}",
+            "matrix.download_error": "账户 {name} 下载文件异常: {error}",
+            "matrix.account_not_found": "账户 {name} 不存在，无法上传媒体",
+            "matrix.upload_failed": "账户 {name} 上传媒体失败: {data}",
+            "matrix.upload_error": "账户 {name} 上传媒体异常: {error}",
+            "matrix.api_timeout": "账户 {name} Matrix API 请求超时: {endpoint}",
+            "matrix.timeout_msg": "请求超时",
+            "matrix.api_call_failed": "账户 {name} 调用 Matrix API 失败: {error}",
+            "matrix.api_error": "API调用失败: {error}",
+            "matrix.no_enabled_accounts": "没有已启用的账户，Matrix 适配器将以空闲状态启动",
+            "matrix.no_bot_id": "账户 {name} 无法获取 bot user_id，请检查配置",
+            "matrix.account_started": "账户 {name} (bot_id: {bot_id}) Matrix 已启动",
+            "matrix.adapter_started": "Matrix 适配器启动完成，共 {count} 个账户",
+            "matrix.adapter_shutdown": "Matrix 适配器已关闭",
+        }
+        en = {
+            "matrix.old_config_detected": "Old single-account config detected, please migrate to Matrix_Adapter.accounts.default",
+            "matrix.save_default_failed": "Failed to save default config: {error}",
+            "matrix.missing_credentials": "Account '{name}' missing access_token/user_id, skipped",
+            "matrix.account_disabled": "Account '{name}' loaded but disabled (enabled=false), please set enabled=true in [Matrix_Adapter.accounts.{name}]",
+            "matrix.accounts_loaded": "Matrix adapter initialized, loaded {count} account(s)",
+            "matrix.authenticated": "Account {name} Matrix authenticated: {bot_id}",
+            "matrix.login_success": "Account {name} Matrix login success: {bot_id}",
+            "matrix.login_failed": "Login failed: {message}",
+            "matrix.login_error": "Account {name} Matrix login failed: {error}",
+            "matrix.initial_sync_failed_nologin": "Account {name} initial sync failed and re-login not possible, stopping sync",
+            "matrix.initial_sync_still_failed": "Account {name} initial sync still failing after re-login, stopping sync",
+            "matrix.auth_failed": "Account {name} auth failed ({count}/{max}): {message}",
+            "matrix.relogin_success": "Account {name} re-login success, resuming sync",
+            "matrix.sync_failed": "Account {name} sync failed ({count}/{max}): {message}",
+            "matrix.max_failures_stop": "Account {name} failed {max} consecutive times, stopping sync loop",
+            "matrix.sync_loop_error": "Account {name} sync loop error: {error}",
+            "matrix.max_exceptions_stop": "Account {name} {max} consecutive exceptions, stopping sync loop",
+            "matrix.relogin_attempt": "Account {name} attempting re-login...",
+            "matrix.relogin_done": "Account {name} re-login success",
+            "matrix.relogin_failed": "Account {name} re-login failed: {error}",
+            "matrix.initial_sync_done": "Account {name} initial sync done, next_batch: {batch}",
+            "matrix.initial_sync_failed": "Account {name} initial sync failed: {message}",
+            "matrix.dm_discovered": "Account {name} discovered {count} DM room(s)",
+            "matrix.process_event": "Account {name} processing Matrix event: {event}",
+            "matrix.process_event_failed": "Failed to process event: {error}",
+            "matrix.room_invite": "Account {name} received room invite: {room}",
+            "matrix.room_joined": "Account {name} auto-joined room: {room}",
+            "matrix.join_room_failed": "Failed to join room: {error}",
+            "matrix.download_failed": "Account {name} download failed: HTTP {status}",
+            "matrix.download_error": "Account {name} download error: {error}",
+            "matrix.account_not_found": "Account {name} not found, cannot upload media",
+            "matrix.upload_failed": "Account {name} upload media failed: {data}",
+            "matrix.upload_error": "Account {name} upload media error: {error}",
+            "matrix.api_timeout": "Account {name} Matrix API request timeout: {endpoint}",
+            "matrix.timeout_msg": "Request timeout",
+            "matrix.api_call_failed": "Account {name} Matrix API call failed: {error}",
+            "matrix.api_error": "API call failed: {error}",
+            "matrix.no_enabled_accounts": "No enabled accounts, Matrix adapter will start idle",
+            "matrix.no_bot_id": "Account {name} could not obtain bot user_id, please check config",
+            "matrix.account_started": "Account {name} (bot_id: {bot_id}) Matrix started",
+            "matrix.adapter_started": "Matrix adapter started, {count} account(s) total",
+            "matrix.adapter_shutdown": "Matrix adapter shut down",
+        }
+        try:
+            i18n.register("zh-CN", zh_CN, domain="matrix")
+            i18n.register("en", en, domain="matrix")
+        except Exception:
+            pass
 
     def _get_config_key(self) -> str:
         return "Matrix_Adapter"
@@ -341,7 +470,7 @@ class MatrixAdapter(BaseAdapter):
             old = config_mgr.getConfig("Matrix_Adapter")
             if old and old.get("access_token"):
                 self.logger.warning(
-                    "检测到旧格式单账户配置，建议迁移到 Matrix_Adapter.accounts.default"
+                    i18n.t("matrix.old_config_detected", default="检测到旧格式单账户配置，建议迁移到 Matrix_Adapter.accounts.default")
                 )
                 data = {"default": {**old, "enabled": True}}
             else:
@@ -358,23 +487,22 @@ class MatrixAdapter(BaseAdapter):
             try:
                 config_mgr.setConfig(key, data)
             except Exception as e:
-                self.logger.error(f"保存默认配置失败: {e}")
+                self.logger.error(i18n.t("matrix.save_default_failed", error=e, default="保存默认配置失败: {error}"))
         accounts = {}
         for name, account_data in data.items():
             if not isinstance(account_data, dict):
                 continue
             if not account_data.get("access_token") and not account_data.get("user_id"):
-                self.logger.warning(f"账户 '{name}' 缺少 access_token/user_id，已跳过")
+                self.logger.warning(i18n.t("matrix.missing_credentials", name=name, default="账户 '{name}' 缺少 access_token/user_id，已跳过"))
                 continue
             instance = dict_to_dataclass(MatrixAccountConfig, account_data)
             instance.name = name
             if not instance.enabled:
                 self.logger.warning(
-                    f"账户 '{name}' 已加载但未启用（enabled=false），"
-                    f"请在配置中将 [Matrix_Adapter.accounts.{name}] 的 enabled 设为 true"
+                    i18n.t("matrix.account_disabled", name=name, default="账户 '{name}' 已加载但未启用（enabled=false），请在配置中将 [Matrix_Adapter.accounts.{name}] 的 enabled 设为 true")
                 )
             accounts[name] = instance
-        self.logger.info(f"Matrix适配器初始化完成，共加载 {len(accounts)} 个账户")
+        self.logger.info(i18n.t("matrix.accounts_loaded", count=len(accounts), default="Matrix适配器初始化完成，共加载 {count} 个账户"))
         return accounts
 
     async def _login_if_needed(self, account_name: str, account: MatrixAccountConfig):
@@ -392,10 +520,9 @@ class MatrixAdapter(BaseAdapter):
                     bot_id = result["data"].get("user_id", "")
                     runtime["bot_id"] = bot_id
                     runtime["access_token"] = account.access_token
-                    account.bot_id = bot_id
                     if converter:
                         converter.bot_user_id = bot_id
-                    self.logger.info(f"账户 {account_name} Matrix 已认证: {bot_id}")
+                    self.logger.info(i18n.t("matrix.authenticated", name=account_name, bot_id=bot_id, default="账户 {name} Matrix 已认证: {bot_id}"))
                     return
             except Exception:
                 pass
@@ -416,20 +543,18 @@ class MatrixAdapter(BaseAdapter):
                 if result.get("status") == "ok" and result.get("data"):
                     token = result["data"].get("access_token", "")
                     bot_id = result["data"].get("user_id", account.user_id)
-                    # 密码登录获得的 token 需回填到账户实例，供后续 call_api 使用
-                    account.access_token = token
+                    # 密码登录获得的 token 写入运行时状态，供后续 call_api 使用
                     runtime["access_token"] = token
                     runtime["bot_id"] = bot_id
-                    account.bot_id = bot_id
                     if converter:
                         converter.bot_user_id = bot_id
-                    self.logger.info(f"账户 {account_name} Matrix 登录成功: {bot_id}")
+                    self.logger.info(i18n.t("matrix.login_success", name=account_name, bot_id=bot_id, default="账户 {name} Matrix 登录成功: {bot_id}"))
                 else:
                     raise Exception(
-                        f"登录失败: {result.get('message', 'Unknown error')}"
+                        i18n.t("matrix.login_failed", message=result.get('message', 'Unknown error'), default="登录失败: {message}")
                     )
             except Exception as e:
-                self.logger.error(f"账户 {account_name} Matrix 登录失败: {e}")
+                self.logger.error(i18n.t("matrix.login_error", name=account_name, error=e, default="账户 {name} Matrix 登录失败: {error}"))
                 raise
 
     async def _sync_loop(self, account_name: str):
@@ -440,13 +565,13 @@ class MatrixAdapter(BaseAdapter):
         if not await self._initial_sync(account_name):
             if not await self._try_relogin(account_name, account):
                 self.logger.error(
-                    f"账户 {account_name} 初始同步失败且无法重新登录，停止同步"
+                    i18n.t("matrix.initial_sync_failed_nologin", name=account_name, default="账户 {name} 初始同步失败且无法重新登录，停止同步")
                 )
                 await self._on_sync_loop_exit(account_name)
                 return
             if not await self._initial_sync(account_name):
                 self.logger.error(
-                    f"账户 {account_name} 重新登录后初始同步仍失败，停止同步"
+                    i18n.t("matrix.initial_sync_still_failed", name=account_name, default="账户 {name} 重新登录后初始同步仍失败，停止同步")
                 )
                 await self._on_sync_loop_exit(account_name)
                 return
@@ -476,23 +601,23 @@ class MatrixAdapter(BaseAdapter):
                     if is_auth_error:
                         consecutive_failures += 1
                         self.logger.warning(
-                            f"账户 {account_name} 认证失败 ({consecutive_failures}/{max_failures}): {message}"
+                            i18n.t("matrix.auth_failed", name=account_name, count=consecutive_failures, max=max_failures, message=message, default="账户 {name} 认证失败 ({count}/{max}): {message}")
                         )
                         if await self._try_relogin(account_name, account):
                             self.logger.info(
-                                f"账户 {account_name} 重新登录成功，继续同步"
+                                i18n.t("matrix.relogin_success", name=account_name, default="账户 {name} 重新登录成功，继续同步")
                             )
                             consecutive_failures = 0
                             continue
                     else:
                         consecutive_failures += 1
                         self.logger.error(
-                            f"账户 {account_name} 同步失败 ({consecutive_failures}/{max_failures}): {message}"
+                            i18n.t("matrix.sync_failed", name=account_name, count=consecutive_failures, max=max_failures, message=message, default="账户 {name} 同步失败 ({count}/{max}): {message}")
                         )
 
                     if consecutive_failures >= max_failures:
                         self.logger.error(
-                            f"账户 {account_name} 连续 {max_failures} 次失败，停止同步循环"
+                            i18n.t("matrix.max_failures_stop", name=account_name, max=max_failures, default="账户 {name} 连续 {max} 次失败，停止同步循环")
                         )
                         break
 
@@ -513,11 +638,11 @@ class MatrixAdapter(BaseAdapter):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(f"账户 {account_name} 同步循环异常: {e}")
+                self.logger.error(i18n.t("matrix.sync_loop_error", name=account_name, error=e, default="账户 {name} 同步循环异常: {error}"))
                 consecutive_failures += 1
                 if consecutive_failures >= max_failures:
                     self.logger.error(
-                        f"账户 {account_name} 连续 {max_failures} 次异常，停止同步循环"
+                        i18n.t("matrix.max_exceptions_stop", name=account_name, max=max_failures, default="账户 {name} 连续 {max} 次异常，停止同步循环")
                     )
                     break
                 await asyncio.sleep(min(5 * consecutive_failures, 30))
@@ -529,7 +654,7 @@ class MatrixAdapter(BaseAdapter):
         if not account or not account.user_id or not account.password:
             return False
         try:
-            self.logger.info(f"账户 {account_name} 尝试重新登录...")
+            self.logger.info(i18n.t("matrix.relogin_attempt", name=account_name, default="账户 {name} 尝试重新登录..."))
             # 清空旧 token，强制走密码登录路径
             old_token = account.access_token
             account.access_token = ""
@@ -539,10 +664,10 @@ class MatrixAdapter(BaseAdapter):
                 # 恢复旧 token，避免状态污染
                 account.access_token = old_token
                 raise
-            self.logger.info(f"账户 {account_name} 重新登录成功")
+            self.logger.info(i18n.t("matrix.relogin_done", name=account_name, default="账户 {name} 重新登录成功"))
             return True
         except Exception as e:
-            self.logger.error(f"账户 {account_name} 重新登录失败: {e}")
+            self.logger.error(i18n.t("matrix.relogin_failed", name=account_name, error=e, default="账户 {name} 重新登录失败: {error}"))
             return False
 
     async def _on_sync_loop_exit(self, account_name: str):
@@ -572,12 +697,12 @@ class MatrixAdapter(BaseAdapter):
             data = result["data"]
             runtime["_next_batch"] = data.get("next_batch", "")
             self.logger.info(
-                f"账户 {account_name} 初始同步完成, next_batch: {runtime.get('_next_batch')}"
+                i18n.t("matrix.initial_sync_done", name=account_name, batch=runtime.get('_next_batch'), default="账户 {name} 初始同步完成, next_batch: {batch}")
             )
             return True
         else:
             self.logger.warning(
-                f"账户 {account_name} 初始同步失败: {result.get('message', 'Unknown error')}"
+                i18n.t("matrix.initial_sync_failed", name=account_name, message=result.get('message', 'Unknown error'), default="账户 {name} 初始同步失败: {message}")
             )
             return False
 
@@ -599,7 +724,7 @@ class MatrixAdapter(BaseAdapter):
             runtime["_dm_rooms"] = dm_rooms
             if converter:
                 converter.set_dm_rooms(dm_rooms)
-            self.logger.info(f"账户 {account_name} 发现 {len(dm_rooms)} 个 DM 房间")
+            self.logger.info(i18n.t("matrix.dm_discovered", name=account_name, count=len(dm_rooms), default="账户 {name} 发现 {count} 个 DM 房间"))
 
     async def _process_sync_response(self, account_name: str, data: dict):
         runtime = self._get_runtime(account_name)
@@ -614,7 +739,7 @@ class MatrixAdapter(BaseAdapter):
             events = timeline.get("events", [])
 
             for event in events:
-                self.logger.debug(f"账户 {account_name} 处理 Matrix 事件: {event}")
+                self.logger.debug(i18n.t("matrix.process_event", name=account_name, event=event, default="账户 {name} 处理 Matrix 事件: {event}"))
                 try:
                     if converter:
                         onebot_event = converter.convert(
@@ -625,7 +750,7 @@ class MatrixAdapter(BaseAdapter):
                     if onebot_event:
                         await self.sdk.adapter.emit(onebot_event)
                 except Exception as e:
-                    self.logger.error(f"处理事件失败: {e}")
+                    self.logger.error(i18n.t("matrix.process_event_failed", error=e, default="处理事件失败: {error}"))
 
         invite_rooms = data.get("rooms", {}).get("invite", {})
         for room_id, room_data in invite_rooms.items():
@@ -637,7 +762,7 @@ class MatrixAdapter(BaseAdapter):
                         content.get("membership") == "invite"
                         and event.get("state_key") == bot_id
                     ):
-                        self.logger.info(f"账户 {account_name} 收到房间邀请: {room_id}")
+                        self.logger.info(i18n.t("matrix.room_invite", name=account_name, room=room_id, default="账户 {name} 收到房间邀请: {room}"))
                         if getattr(
                             self.accounts.get(account_name), "auto_accept_invites", True
                         ):
@@ -648,17 +773,17 @@ class MatrixAdapter(BaseAdapter):
                                     _account_id=account_name,
                                 )
                                 self.logger.info(
-                                    f"账户 {account_name} 已自动加入房间: {room_id}"
+                                    i18n.t("matrix.room_joined", name=account_name, room=room_id, default="账户 {name} 已自动加入房间: {room}")
                                 )
                             except Exception as e:
-                                self.logger.error(f"加入房间失败: {e}")
+                                self.logger.error(i18n.t("matrix.join_room_failed", error=e, default="加入房间失败: {error}"))
 
     async def _download_file(self, account_name: str, url: str) -> Optional[tuple]:
         try:
             resp = await client.get(url, timeout=300)
             if resp.status != 200:
                 self.logger.error(
-                    f"账户 {account_name} 下载文件失败: HTTP {resp.status}"
+                    i18n.t("matrix.download_failed", name=account_name, status=resp.status, default="账户 {name} 下载文件失败: HTTP {status}")
                 )
                 return None
             content_type = (
@@ -667,7 +792,7 @@ class MatrixAdapter(BaseAdapter):
             data = await resp.read()
             return (data, content_type)
         except Exception as e:
-            self.logger.error(f"账户 {account_name} 下载文件异常: {e}")
+            self.logger.error(i18n.t("matrix.download_error", name=account_name, error=e, default="账户 {name} 下载文件异常: {error}"))
             return None
 
     async def _upload_media(
@@ -679,7 +804,7 @@ class MatrixAdapter(BaseAdapter):
     ) -> Optional[str]:
         account = self.accounts.get(account_name)
         if not account:
-            self.logger.error(f"账户 {account_name} 不存在，无法上传媒体")
+            self.logger.error(i18n.t("matrix.account_not_found", name=account_name, default="账户 {name} 不存在，无法上传媒体"))
             return None
         if not content_type:
             content_type_map = {
@@ -692,8 +817,11 @@ class MatrixAdapter(BaseAdapter):
 
         homeserver = (account.homeserver or "https://matrix.org").rstrip("/")
         url = f"{homeserver}/_matrix/media/v3/upload"
+        # 优先使用运行时 token（同 call_api）
+        runtime = self._get_runtime(account_name)
+        access_token = runtime.get("access_token") or account.access_token
         headers = {
-            "Authorization": f"Bearer {account.access_token}",
+            "Authorization": f"Bearer {access_token}",
             "Content-Type": content_type,
         }
 
@@ -703,10 +831,10 @@ class MatrixAdapter(BaseAdapter):
             if resp.status == 200:
                 return data.get("content_uri", "")
             else:
-                self.logger.error(f"账户 {account_name} 上传媒体失败: {data}")
+                self.logger.error(i18n.t("matrix.upload_failed", name=account_name, data=data, default="账户 {name} 上传媒体失败: {data}"))
                 return None
         except Exception as e:
-            self.logger.error(f"账户 {account_name} 上传媒体异常: {e}")
+            self.logger.error(i18n.t("matrix.upload_error", name=account_name, error=e, default="账户 {name} 上传媒体异常: {error}"))
             return None
 
     async def call_api(
@@ -715,8 +843,11 @@ class MatrixAdapter(BaseAdapter):
         account_name, account = self._resolve_account(_account_id)
         homeserver = (account.homeserver or "https://matrix.org").rstrip("/")
         url = f"{homeserver}{endpoint}"
+        # 优先使用运行时 token（密码登录后获得），避免 self.accounts 每次重新读取配置导致 token 丢失
+        runtime = self._get_runtime(account_name)
+        access_token = runtime.get("access_token") or account.access_token
         headers = {
-            "Authorization": f"Bearer {account.access_token}",
+            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
         echo = params.pop("echo", None)
@@ -773,15 +904,15 @@ class MatrixAdapter(BaseAdapter):
             return response
 
         except asyncio.TimeoutError:
-            self.logger.error(f"账户 {account_name} Matrix API 请求超时: {endpoint}")
-            err = self.make_error(retcode=32000, message="请求超时", raw=None)
+            self.logger.error(i18n.t("matrix.api_timeout", name=account_name, endpoint=endpoint, default="账户 {name} Matrix API 请求超时: {endpoint}"))
+            err = self.make_error(retcode=32000, message=i18n.t("matrix.timeout_msg", default="请求超时"), raw=None)
             if echo:
                 err["echo"] = echo
             return err
         except Exception as e:
-            self.logger.error(f"账户 {account_name} 调用 Matrix API 失败: {e}")
+            self.logger.error(i18n.t("matrix.api_call_failed", name=account_name, error=e, default="账户 {name} 调用 Matrix API 失败: {error}"))
             err = self.make_error(
-                retcode=33000, message=f"API调用失败: {str(e)}", raw=None
+                retcode=33000, message=i18n.t("matrix.api_error", error=str(e), default="API调用失败: {error}"), raw=None
             )
             if echo:
                 err["echo"] = echo
@@ -800,7 +931,7 @@ class MatrixAdapter(BaseAdapter):
         self._running = True
 
         if not self.enabled_accounts:
-            self.logger.warning("没有已启用的账户，Matrix 适配器将以空闲状态启动")
+            self.logger.warning(i18n.t("matrix.no_enabled_accounts", default="没有已启用的账户，Matrix 适配器将以空闲状态启动"))
             return
 
         for account_name, account in self.enabled_accounts.items():
@@ -819,7 +950,7 @@ class MatrixAdapter(BaseAdapter):
             runtime = self._get_runtime(account_name)
             if not runtime.get("bot_id"):
                 self.logger.error(
-                    f"账户 {account_name} 无法获取 bot user_id，请检查配置"
+                    i18n.t("matrix.no_bot_id", name=account_name, default="账户 {name} 无法获取 bot user_id，请检查配置")
                 )
                 continue
 
@@ -831,11 +962,11 @@ class MatrixAdapter(BaseAdapter):
                 self._sync_loop(account_name)
             )
             self.logger.info(
-                f"账户 {account_name} (bot_id: {runtime.get('bot_id')}) Matrix 已启动"
+                i18n.t("matrix.account_started", name=account_name, bot_id=runtime.get('bot_id'), default="账户 {name} (bot_id: {bot_id}) Matrix 已启动")
             )
 
         self.logger.info(
-            f"Matrix 适配器启动完成，共 {len(self.enabled_accounts)} 个账户"
+            i18n.t("matrix.adapter_started", count=len(self.enabled_accounts), default="Matrix 适配器启动完成，共 {count} 个账户")
         )
 
     async def shutdown(self):
@@ -870,4 +1001,4 @@ class MatrixAdapter(BaseAdapter):
             unregister_platform_event_methods("matrix")
         except Exception:
             pass
-        self.logger.info("Matrix 适配器已关闭")
+        self.logger.info(i18n.t("matrix.adapter_shutdown", default="Matrix 适配器已关闭"))
