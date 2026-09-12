@@ -2,9 +2,12 @@ import time
 import uuid
 from typing import Dict, Optional, List
 
+from ErisPulse.Core.Bases import BaseConverter
 
-class MatrixConverter:
+
+class MatrixConverter(BaseConverter):
     def __init__(self, bot_user_id: str = ""):
+        super().__init__(platform="matrix")
         self.bot_user_id = bot_user_id
         self._dm_rooms: Dict[str, str] = {}
 
@@ -31,19 +34,13 @@ class MatrixConverter:
         if sender == self.bot_user_id:
             return None
 
-        base_event = {
-            "id": event_id,
-            "time": event_time,
-            "type": "",
-            "detail_type": "",
-            "platform": "matrix",
-            "self": {
-                "platform": "matrix",
-                "user_id": self.bot_user_id,
-            },
-            "matrix_raw": raw_event,
-            "matrix_raw_type": event_type,
-        }
+        # 基础事件结构（BaseConverter 骨架 + Matrix 语义覆盖）
+        base_event = self.build_base_event(raw_event, event_type)
+        base_event["id"] = str(event_id)
+        base_event["time"] = event_time
+        base_event["type"] = ""
+        base_event["detail_type"] = ""
+        base_event["self"]["user_id"] = self.bot_user_id
 
         if is_dm:
             base_event["detail_type"] = "private"
@@ -61,6 +58,7 @@ class MatrixConverter:
 
     def _handle_m_room_message(self, raw_event: Dict, base_event: Dict, room_id: str, is_dm: bool) -> Dict:
         base_event["type"] = "message"
+        base_event["message_id"] = str(raw_event.get("event_id", ""))
         base_event["user_id"] = raw_event.get("sender", "")
         base_event["user_nickname"] = raw_event.get("sender", "")
 

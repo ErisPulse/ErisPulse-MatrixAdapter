@@ -7,11 +7,21 @@ from typing import Dict, List, Optional
 
 from ErisPulse.Core import client
 from ErisPulse.Core.Bases.adapter import BaseAdapter
+from ErisPulse.Core.Bases import BotAccountConfig
 from ErisPulse.Core.Event import register_event_mixin, unregister_platform_event_methods
-from ErisPulse.runtime.config_schema import BotAccountConfig
 from ErisPulse.Core.i18n import i18n
 
 from .Converter import MatrixConverter
+
+try:
+    from ErisPulse.runtime.tasks import spawn_background
+except ImportError:  # pragma: no cover
+    spawn_background = None
+
+__version__ = "4.2.0"
+
+# 软依赖的框架最低版本（运行时检测，仅提示不强制）
+MIN_FRAMEWORK_VERSION = (2, 7, 1)
 
 
 # ============================================================================
@@ -331,7 +341,40 @@ class MatrixAdapter(BaseAdapter):
         self._heartbeat_meta_tasks: Dict[str, asyncio.Task] = {}
         self._converters: Dict[str, MatrixConverter] = {}
         self._running = False
+        self._message_targets: Dict[str, str] = {}
         self._register_i18n()
+        self._check_framework_version()
+        self._get_logger().info(f"MatrixAdapter v{__version__} 已加载")
+
+    @staticmethod
+    def _parse_version(version_str: str) -> tuple:
+        """解析版本号为可比较的三元组（忽略 dev/预发布后缀，如 2.8.0-dev.3 → (2, 8, 0)）"""
+        parts = []
+        for piece in str(version_str).split("."):
+            digits = "".join(ch for ch in piece if ch.isdigit())
+            parts.append(int(digits) if digits else 0)
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+
+    def _check_framework_version(self):
+        """软依赖检测：框架版本过低时打警告（不阻断加载）"""
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            raw = _pkg_version("ErisPulse")
+        except Exception:
+            return
+        try:
+            if self._parse_version(raw) < MIN_FRAMEWORK_VERSION:
+                self._get_logger().warning(
+                    f"当前 ErisPulse 版本 {raw} 过低：MatrixAdapter v{__version__} 需要 >= "
+                    f"{'.'.join(map(str, MIN_FRAMEWORK_VERSION))}"
+                    "（BaseConverter / Api DSL / spawn_background 等特性），"
+                    "部分功能可能不可用，建议升级框架"
+                )
+        except Exception:
+            pass
 
     def _register_i18n(self):
         """注册配置字段与日志消息的 i18n 翻译"""
@@ -449,6 +492,39 @@ class MatrixAdapter(BaseAdapter):
     def _get_config_key(self) -> str:
         return "Matrix_Adapter"
 
+    async def _delete_message_by_id(self, message_id: str, account_id: Optional[str] = None) -> dict:
+        """按消息登记表撤回消息（Matrix redact 需要 room_id + event_id）"""
+        room_id = self._message_targets.get(message_id)
+        if not room_id:
+            return self.make_error(retcode=34001, message=f"未找到消息 {message_id} 的目标上下文，无法撤回")
+        import uuid as _uuid
+
+        txn_id = _uuid.uuid4().hex
+        return await self.call_api(
+            f"/_matrix/client/v3/rooms/{room_id}/redact/{message_id}/{txn_id}",
+            method="PUT", _account_id=account_id,
+        )
+
+    def _migrate_legacy_config(self):
+        """将旧版单账户扁平配置（access_token 直接在 [Matrix_Adapter] 下）迁移到 accounts 结构"""
+        try:
+            from ErisPulse.Core import config as config_mgr
+
+            key = self._get_config_key()
+            data = config_mgr.getConfig(key)
+            if not isinstance(data, dict):
+                return
+            accounts = data.get("accounts")
+            if isinstance(accounts, dict) and accounts:
+                return
+            if not data.get("access_token"):
+                return
+            data["accounts"] = {"default": {**data, "enabled": True}}
+            config_mgr.setConfig(key, data)
+            self.logger.info("已将旧版单账户配置迁移到 accounts.default")
+        except Exception as e:
+            self.logger.debug(f"旧配置迁移检查跳过: {e}")
+
     def _get_runtime(self, name: str) -> dict:
         if name not in self._account_runtime:
             self._account_runtime[name] = {
@@ -459,51 +535,8 @@ class MatrixAdapter(BaseAdapter):
             }
         return self._account_runtime[name]
 
-    def _load_accounts(self) -> dict:
-        from ErisPulse.Core.config import config as config_mgr
-        from ErisPulse.runtime.config_schema import dict_to_dataclass
-
-        key = "Matrix_Adapter.accounts"
-        data = config_mgr.getConfig(key)
-        if not data:
-            # 兼容旧配置：如果存在旧的单账户 Matrix_Adapter 配置且有 access_token，迁移为 default 账户
-            old = config_mgr.getConfig("Matrix_Adapter")
-            if old and old.get("access_token"):
-                self.logger.warning(
-                    i18n.t("matrix.old_config_detected", default="检测到旧格式单账户配置，建议迁移到 Matrix_Adapter.accounts.default")
-                )
-                data = {"default": {**old, "enabled": True}}
-            else:
-                data = {
-                    "default": {
-                        "homeserver": "https://matrix.org",
-                        "access_token": "",
-                        "user_id": "",
-                        "password": "",
-                        "auto_accept_invites": True,
-                        "enabled": True,
-                    }
-                }
-            try:
-                config_mgr.setConfig(key, data)
-            except Exception as e:
-                self.logger.error(i18n.t("matrix.save_default_failed", error=e, default="保存默认配置失败: {error}"))
-        accounts = {}
-        for name, account_data in data.items():
-            if not isinstance(account_data, dict):
-                continue
-            if not account_data.get("access_token") and not account_data.get("user_id"):
-                self.logger.warning(i18n.t("matrix.missing_credentials", name=name, default="账户 '{name}' 缺少 access_token/user_id，已跳过"))
-                continue
-            instance = dict_to_dataclass(MatrixAccountConfig, account_data)
-            instance.name = name
-            if not instance.enabled:
-                self.logger.warning(
-                    i18n.t("matrix.account_disabled", name=name, default="账户 '{name}' 已加载但未启用（enabled=false），请在配置中将 [Matrix_Adapter.accounts.{name}] 的 enabled 设为 true")
-                )
-            accounts[name] = instance
-        self.logger.info(i18n.t("matrix.accounts_loaded", count=len(accounts), default="Matrix适配器初始化完成，共加载 {count} 个账户"))
-        return accounts
+    # 账户加载使用框架默认实现（AccountConfigClass 模板 + 校验）；
+    # 旧版单账户扁平配置迁移见 _migrate_legacy_config；缺少凭据的账户由 _login_if_needed 失败自然跳过。
 
     async def _login_if_needed(self, account_name: str, account: MatrixAccountConfig):
         runtime = self._get_runtime(account_name)
@@ -748,6 +781,10 @@ class MatrixAdapter(BaseAdapter):
                     else:
                         onebot_event = None
                     if onebot_event:
+                        if onebot_event.get("type") == "message" and onebot_event.get("message_id"):
+                            self._message_targets[str(onebot_event["message_id"])] = str(room_id)
+                            while len(self._message_targets) > 800:
+                                self._message_targets.pop(next(iter(self._message_targets)), None)
                         await self.sdk.adapter.emit(onebot_event)
                 except Exception as e:
                     self.logger.error(i18n.t("matrix.process_event_failed", error=e, default="处理事件失败: {error}"))
@@ -927,6 +964,116 @@ class MatrixAdapter(BaseAdapter):
         except asyncio.CancelledError:
             pass
 
+    # ==================== Api DSL ====================
+
+    class Api(BaseAdapter.Api):
+        """Matrix 标准 API 动作实现（ApiDSL，基于 Matrix Client-Server API）
+
+        {!--< tips >!--}
+        1. get_self_info → GET /account/whoami
+        2. get_user_info → GET /profile/{userId}
+        3. get_group_info → GET /rooms/{roomId}/state/m.room.name
+        4. get_group_list → GET /joined_rooms；get_group_member_list → GET /rooms/{roomId}/members
+        5. delete_message → PUT /rooms/{roomId}/redact/{eventId}/{txn}（登记表补全 roomId）
+        6. leave_group → POST /rooms/{roomId}/leave
+        {!--< /tips >!--}
+        """
+
+        async def get_self_info(self) -> dict:
+            r = await self._adapter.call_api(
+                "/_matrix/client/v3/account/whoami", method="GET",
+                _account_id=self._account_id,
+            )
+            if r.get("status") != "ok":
+                return r
+            u = r.get("data") or {}
+            r["data"] = {"user_id": str(u.get("user_id", "")), "user_name": str(u.get("user_id", "")).split(":")[0].lstrip("@")}
+            return r
+
+        async def get_user_info(self, user_id: str) -> dict:
+            r = await self._adapter.call_api(
+                f"/_matrix/client/v3/profile/{user_id}", method="GET",
+                _account_id=self._account_id,
+            )
+            if r.get("status") != "ok":
+                return r
+            u = r.get("data") or {}
+            r["data"] = {
+                "user_id": str(user_id),
+                "user_name": u.get("displayname", ""),
+                "user_avatar": u.get("avatar_url", ""),
+            }
+            return r
+
+        async def get_group_info(self, room_id: str) -> dict:
+            r = await self._adapter.call_api(
+                f"/_matrix/client/v3/rooms/{room_id}/state/m.room.name", method="GET",
+                _account_id=self._account_id,
+            )
+            if r.get("status") != "ok":
+                return r
+            r["data"] = {"group_id": str(room_id), "group_name": (r.get("data") or {}).get("name", "")}
+            return r
+
+        async def get_group_list(self) -> dict:
+            r = await self._adapter.call_api(
+                "/_matrix/client/v3/joined_rooms", method="GET", _account_id=self._account_id
+            )
+            if r.get("status") != "ok":
+                return r
+            rooms = (r.get("data") or {}).get("joined_rooms", []) or []
+            r["data"] = [{"group_id": str(x)} for x in rooms]
+            return r
+
+        async def get_group_member_list(self, room_id: str) -> dict:
+            r = await self._adapter.call_api(
+                f"/_matrix/client/v3/rooms/{room_id}/members",
+                method="GET", _account_id=self._account_id,
+            )
+            if r.get("status") != "ok":
+                return r
+            chunk = (r.get("data") or {}).get("chunk", []) or []
+            members = []
+            for m in chunk:
+                if isinstance(m, dict) and m.get("sender"):
+                    members.append({"user_id": str(m["sender"])})
+            r["data"] = members
+            return r
+
+        async def leave_group(self, room_id: str) -> dict:
+            return await self._adapter.call_api(
+                f"/_matrix/client/v3/rooms/{room_id}/leave", method="POST",
+                _account_id=self._account_id,
+            )
+
+        async def delete_message(self, message_id: str) -> dict:
+            return await self._adapter._delete_message_by_id(str(message_id), account_id=self._account_id)
+
+        async def get_status(self) -> dict:
+            ad = self._adapter
+            bots = []
+            for name, runtime in ad._account_runtime.items():
+                bots.append({
+                    "self": {"platform": ad.platform, "user_id": runtime.get("bot_id", ""), "account_id": name},
+                    "online": bool(runtime.get("bot_id")),
+                })
+            return ad.make_response(data={"good": any(b["online"] for b in bots), "bots": bots})
+
+        async def get_version(self) -> dict:
+            from . import __version__
+
+            return self._adapter.make_response(
+                data={"impl": "ErisPulse-MatrixAdapter", "version": __version__, "onebot_version": "12"}
+            )
+
+        async def get_supported_actions(self) -> dict:
+            actions = {
+                "get_self_info", "get_user_info", "get_group_info", "get_group_list",
+                "get_group_member_list", "leave_group", "delete_message",
+                "get_status", "get_version", "get_supported_actions",
+            }
+            return self._adapter.make_response(data=sorted(actions))
+
     async def start(self):
         self._running = True
 
@@ -955,11 +1102,14 @@ class MatrixAdapter(BaseAdapter):
                 continue
 
             await self.emit_meta("connect", runtime.get("bot_id", ""))
-            self._heartbeat_meta_tasks[account_name] = asyncio.create_task(
-                self._heartbeat_meta_loop(account_name)
+            hb_coro = self._heartbeat_meta_loop(account_name)
+            sync_coro = self._sync_loop(account_name)
+            # 生命周期任务使用 spawn_background（owner 归属，shutdown 自动回收）
+            self._heartbeat_meta_tasks[account_name] = (
+                spawn_background(hb_coro) if spawn_background is not None else asyncio.create_task(hb_coro)
             )
-            self._sync_tasks[account_name] = asyncio.create_task(
-                self._sync_loop(account_name)
+            self._sync_tasks[account_name] = (
+                spawn_background(sync_coro) if spawn_background is not None else asyncio.create_task(sync_coro)
             )
             self.logger.info(
                 i18n.t("matrix.account_started", name=account_name, bot_id=runtime.get('bot_id'), default="账户 {name} (bot_id: {bot_id}) Matrix 已启动")
