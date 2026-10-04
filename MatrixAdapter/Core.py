@@ -12,13 +12,14 @@ from ErisPulse.Core.Event import register_event_mixin, unregister_platform_event
 from ErisPulse.Core.i18n import i18n
 
 from .Converter import MatrixConverter
+from .NioSession import NIO_AVAILABLE, NioSession, NioSessionError
 
 try:
     from ErisPulse.runtime.tasks import spawn_background
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "4.2.0"
+__version__ = "4.3.0"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
@@ -72,6 +73,34 @@ class MatrixAccountConfig(BotAccountConfig):
             "ui": {"widget": "switch", "group": "behavior", "order": 5},
         },
     )
+    encryption_enabled: bool = field(
+        default=False,
+        metadata={
+            "description": {"i18n": "matrix.encryption_enabled", "default": "启用端到端加密（加密房间消息自动加解密）"},
+            "ui": {"widget": "switch", "group": "encryption", "order": 6},
+        },
+    )
+    trust_all_devices: bool = field(
+        default=True,
+        metadata={
+            "description": {"i18n": "matrix.trust_all_devices", "default": "自动信任未验证设备（关闭后不向未验证设备分发消息密钥）"},
+            "ui": {"widget": "switch", "group": "encryption", "order": 7},
+        },
+    )
+    device_id: str = field(
+        default="",
+        metadata={
+            "description": {"i18n": "matrix.device_id", "default": "设备 ID（通常自动获取，仅在服务器不支持时手动指定）"},
+            "ui": {"widget": "text", "group": "encryption", "order": 8},
+        },
+    )
+    store_path: str = field(
+        default="",
+        metadata={
+            "description": {"i18n": "matrix.store_path", "default": "加密会话存储目录（默认 data/matrix/<账户名>，请勿删除）"},
+            "ui": {"widget": "text", "group": "encryption", "order": 9, "placeholder": {"i18n": "matrix.store_path.ph", "default": "data/matrix/<账户名>"}},
+        },
+    )
 
 
 MatrixAccountConfig._schema_meta = {
@@ -79,6 +108,7 @@ MatrixAccountConfig._schema_meta = {
         "basic": {"i18n": "matrix.group.basic", "default": "基本设置"},
         "connection": {"i18n": "matrix.group.connection", "default": "连接设置"},
         "behavior": {"i18n": "matrix.group.behavior", "default": "行为设置"},
+        "encryption": {"i18n": "matrix.group.encryption", "default": "端到端加密"},
     }
 }  # type: ignore[attr-defined]
 
@@ -101,6 +131,9 @@ class MatrixEventMixin:
 
     def is_edited(self) -> bool:
         return self.get("matrix_edit", False)
+
+    def is_encrypted(self) -> bool:
+        return bool(self.get("matrix_raw", {}).get("matrix_e2ee", False))
 
     def is_notice(self) -> bool:
         raw = self.get("matrix_raw", {})
@@ -207,24 +240,51 @@ class MatrixAdapter(BaseAdapter):
             account_id = ctx.get("account_id")
             # 多账户：解析当前发送所用账户（用于媒体上传/下载与发送）
             account_name, _ = self._adapter._resolve_account(account_id)
+            # E2EE：目标房间为加密房间且会话就绪时，媒体加密上传 + 事件加密发送
+            session = self._adapter._nio_session_for(account_name)
+            room_encrypted = bool(session and target_room and session.is_room_encrypted(target_room))
             content = None
 
-            if media_file and isinstance(media_file, bytes):
+            async def _upload_bytes(file_bytes: bytes, content_type: str = None):
+                """上传媒体；加密房间走端到端加密上传。返回 (mxc_uri, file_dict)"""
+                if room_encrypted:
+                    ct = content_type
+                    if not ct:
+                        ct = {
+                            "image": "image/png",
+                            "voice": "audio/ogg",
+                            "video": "video/mp4",
+                            "file": "application/octet-stream",
+                        }.get(media_type, "application/octet-stream")
+                    mxc_uri, file_dict, err = await session.upload_media(
+                        file_bytes, ct, encrypt=True
+                    )
+                    if not mxc_uri:
+                        self._adapter._get_logger().error(
+                            i18n.t("matrix.e2ee_upload_failed", name=account_name, error=err, default="账户 {name} 加密媒体上传失败: {error}")
+                        )
+                        return None, None
+                    return mxc_uri, file_dict
                 mxc_uri = await self._adapter._upload_media(
-                    account_name, media_file, media_type
+                    account_name, file_bytes, media_type, content_type=content_type
                 )
+                return mxc_uri, None
+
+            if media_file and isinstance(media_file, bytes):
+                mxc_uri, file_dict = await _upload_bytes(media_file)
                 if not mxc_uri:
                     return self._adapter.make_error(
                         retcode=32000, message="媒体上传失败", raw=None
                     )
                 content = self._build_media_content(
-                    media_type, mxc_uri, media_filename or full_text
+                    media_type, mxc_uri, media_filename or full_text, file_dict=file_dict
                 )
             elif (
                 media_file
                 and isinstance(media_file, str)
                 and media_file.startswith("mxc://")
             ):
+                # 模块直传已有 mxc（无论明文/密文）不做二次处理
                 content = self._build_media_content(
                     media_type, media_file, media_filename or full_text
                 )
@@ -242,25 +302,25 @@ class MatrixAdapter(BaseAdapter):
                 upload_ct = (
                     download_ct if download_ct and "text/" not in download_ct else None
                 )
-                mxc_uri = await self._adapter._upload_media(
-                    account_name, file_bytes, media_type, content_type=upload_ct
-                )
+                mxc_uri, file_dict = await _upload_bytes(file_bytes, upload_ct)
                 if not mxc_uri:
                     return self._adapter.make_error(
                         retcode=32000, message="媒体上传失败", raw=None
                     )
                 mimetype = upload_ct
                 content = self._build_media_content(
-                    media_type, mxc_uri, media_filename or full_text, mimetype=mimetype
+                    media_type,
+                    mxc_uri,
+                    media_filename or full_text,
+                    mimetype=mimetype,
+                    file_dict=file_dict,
                 )
             elif media_file:
                 path = Path(str(media_file))
                 if path.is_file():
                     file_bytes = path.read_bytes()
                     guessed_type, _ = mimetypes.guess_type(str(path))
-                    mxc_uri = await self._adapter._upload_media(
-                        account_name, file_bytes, media_type, content_type=guessed_type
-                    )
+                    mxc_uri, file_dict = await _upload_bytes(file_bytes, guessed_type)
                     if not mxc_uri:
                         return self._adapter.make_error(
                             retcode=32000, message="媒体上传失败", raw=None
@@ -270,6 +330,7 @@ class MatrixAdapter(BaseAdapter):
                         mxc_uri,
                         media_filename or path.name or full_text,
                         mimetype=guessed_type,
+                        file_dict=file_dict,
                     )
 
             if content is None:
@@ -296,6 +357,25 @@ class MatrixAdapter(BaseAdapter):
                 if self._at_all:
                     content["m.mentions"]["room"] = True
 
+            # E2EE：加密房间经 nio 会话加密发送（自动分享 Megolm 会话并加密 content）
+            if room_encrypted:
+                ok, event_id, err = await session.send_event(
+                    target_room, "m.room.message", content
+                )
+                if not ok:
+                    self._adapter._get_logger().error(
+                        i18n.t("matrix.e2ee_send_failed", name=account_name, error=err, default="账户 {name} 加密发送失败: {error}")
+                    )
+                    return self._adapter.make_error(retcode=34000, message=err, raw=None)
+                return self._adapter.make_response(
+                    status="ok",
+                    retcode=0,
+                    data={"event_id": event_id, "message_id": event_id},
+                    message_id=event_id,
+                    message="",
+                    raw={"event_id": event_id},
+                )
+
             txn_id = str(uuid.uuid4())
             endpoint = (
                 f"/_matrix/client/v3/rooms/{target_room}/send/m.room.message/{txn_id}"
@@ -306,7 +386,8 @@ class MatrixAdapter(BaseAdapter):
             )
 
         def _build_media_content(
-            self, media_type: str, mxc_uri: str, body: str, mimetype: str = None
+            self, media_type: str, mxc_uri: str, body: str, mimetype: str = None,
+            file_dict: Dict = None,
         ) -> Dict:
             msgtype_map = {
                 "image": "m.image",
@@ -322,24 +403,30 @@ class MatrixAdapter(BaseAdapter):
                     "file": "application/octet-stream",
                 }
                 mimetype = mimetype_map.get(media_type, "application/octet-stream")
-            return {
+            media_content = {
                 "msgtype": msgtype_map.get(media_type, "m.file"),
                 "body": body or media_type,
-                "url": mxc_uri,
                 "info": {
                     "mimetype": mimetype,
                 },
             }
+            if file_dict:
+                # 端到端加密媒体：m.file.encrypted（JWK）替代明文 url
+                media_content["file"] = file_dict
+            else:
+                media_content["url"] = mxc_uri
+            return media_content
 
     # ---- 适配器方法 ----
     def __init__(self, sdk_ref=None):
         super().__init__(sdk_ref)
         # 每个账户的运行时状态（登录后获得，不属于配置）
-        # _account_runtime[name] = {bot_id, access_token, _next_batch, _dm_rooms}
+        # _account_runtime[name] = {bot_id, access_token, _next_batch, _dm_rooms, device_id}
         self._account_runtime: Dict[str, dict] = {}
         self._sync_tasks: Dict[str, asyncio.Task] = {}
         self._heartbeat_meta_tasks: Dict[str, asyncio.Task] = {}
         self._converters: Dict[str, MatrixConverter] = {}
+        self._nio_sessions: Dict[str, NioSession] = {}
         self._running = False
         self._message_targets: Dict[str, str] = {}
         self._register_i18n()
@@ -388,9 +475,15 @@ class MatrixAdapter(BaseAdapter):
                 "matrix.user_id": "Username (used for password login)",
                 "matrix.password": "Password (used for password login)",
                 "matrix.auto_accept_invites": "Automatically accept room invitations",
+                "matrix.encryption_enabled": "Enable end-to-end encryption (auto encrypt/decrypt messages in encrypted rooms)",
+                "matrix.trust_all_devices": "Automatically trust unverified devices (when disabled, message keys will not be shared with unverified devices)",
+                "matrix.device_id": "Device ID (usually auto-detected; specify manually only if the server does not report it)",
+                "matrix.store_path": "Crypto session store directory (default data/matrix/<account>, do not delete)",
+                "matrix.store_path.ph": "data/matrix/<account>",
                 "matrix.group.basic": "Basic",
                 "matrix.group.connection": "Connection",
                 "matrix.group.behavior": "Behavior",
+                "matrix.group.encryption": "End-to-End Encryption",
             }, domain="matrix")
         except Exception:
             pass
@@ -438,6 +531,14 @@ class MatrixAdapter(BaseAdapter):
             "matrix.account_started": "账户 {name} (bot_id: {bot_id}) Matrix 已启动",
             "matrix.adapter_started": "Matrix 适配器启动完成，共 {count} 个账户",
             "matrix.adapter_shutdown": "Matrix 适配器已关闭",
+            "matrix.e2ee_nio_missing": "账户 {name} 已启用端到端加密，但 matrix-nio 未安装，将以明文模式运行。请执行: pip install matrix-nio[e2e]",
+            "matrix.e2ee_device_id_missing": "账户 {name} 无法获取 device_id（服务器 /whoami 未返回且未配置），端到端加密已禁用。可在配置中手动指定 device_id",
+            "matrix.e2ee_session_started": "账户 {name} 端到端加密会话已建立 (device: {device_id})",
+            "matrix.e2ee_session_failed": "账户 {name} 端到端加密会话初始化失败，将以明文模式运行: {error}",
+            "matrix.e2ee_relogin_rebuild": "账户 {name} 重新登录后正在重建端到端加密会话...",
+            "matrix.e2ee_send_failed": "账户 {name} 加密发送失败: {error}",
+            "matrix.e2ee_upload_failed": "账户 {name} 加密媒体上传失败: {error}",
+            "matrix.e2ee_strict_mode": "账户 {name} 运行在严格信任模式：未验证设备将无法解密新消息",
         }
         en = {
             "matrix.old_config_detected": "Old single-account config detected, please migrate to Matrix_Adapter.accounts.default",
@@ -482,6 +583,14 @@ class MatrixAdapter(BaseAdapter):
             "matrix.account_started": "Account {name} (bot_id: {bot_id}) Matrix started",
             "matrix.adapter_started": "Matrix adapter started, {count} account(s) total",
             "matrix.adapter_shutdown": "Matrix adapter shut down",
+            "matrix.e2ee_nio_missing": "Account {name} has encryption enabled but matrix-nio is not installed, running in plaintext mode. Run: pip install matrix-nio[e2e]",
+            "matrix.e2ee_device_id_missing": "Account {name} could not obtain device_id (server /whoami did not return one and none configured), end-to-end encryption disabled. You may specify device_id in config manually",
+            "matrix.e2ee_session_started": "Account {name} end-to-end encryption session established (device: {device_id})",
+            "matrix.e2ee_session_failed": "Account {name} failed to initialize E2EE session, running in plaintext mode: {error}",
+            "matrix.e2ee_relogin_rebuild": "Account {name} rebuilding E2EE session after re-login...",
+            "matrix.e2ee_send_failed": "Account {name} encrypted send failed: {error}",
+            "matrix.e2ee_upload_failed": "Account {name} encrypted media upload failed: {error}",
+            "matrix.e2ee_strict_mode": "Account {name} running in strict trust mode: unverified devices will not be able to decrypt new messages",
         }
         try:
             i18n.register("zh-CN", zh_CN, domain="matrix")
@@ -532,8 +641,121 @@ class MatrixAdapter(BaseAdapter):
                 "access_token": "",
                 "_next_batch": None,
                 "_dm_rooms": {},
+                "device_id": "",
             }
         return self._account_runtime[name]
+
+    # ==================== 端到端加密（E2EE） ====================
+
+    def _e2ee_store_path(self, account_name: str, account: MatrixAccountConfig) -> str:
+        if account.store_path:
+            return account.store_path
+        return str(Path("data") / "matrix" / account_name)
+
+    def _load_persisted_device_id(self, account_name: str, account: MatrixAccountConfig) -> str:
+        try:
+            device_file = Path(self._e2ee_store_path(account_name, account)) / "device.json"
+            if device_file.is_file():
+                import json as _json
+
+                return (_json.loads(device_file.read_text("utf-8")) or {}).get("device_id", "")
+        except Exception:
+            pass
+        return ""
+
+    def _persist_device_id(self, account_name: str, account: MatrixAccountConfig, device_id: str):
+        try:
+            import json as _json
+
+            store_dir = Path(self._e2ee_store_path(account_name, account))
+            store_dir.mkdir(parents=True, exist_ok=True)
+            (store_dir / "device.json").write_text(
+                _json.dumps({"device_id": device_id}), encoding="utf-8"
+            )
+        except Exception as e:
+            self._get_logger().debug(f"持久化 device_id 失败: {e}")
+
+    def _resolve_device_id(self, account_name: str, account: MatrixAccountConfig) -> str:
+        """device_id 解析优先级：配置项 > 持久化值 > 登录响应（runtime）"""
+        if account.device_id:
+            return account.device_id
+        persisted = self._load_persisted_device_id(account_name, account)
+        if persisted:
+            return persisted
+        return self._get_runtime(account_name).get("device_id", "")
+
+    def _nio_session_for(self, account_name: str) -> Optional[NioSession]:
+        """返回账户的活跃 E2EE 会话；未启用/未就绪返回 None（发送侧据此走明文 REST）"""
+        session = self._nio_sessions.get(account_name)
+        if session is not None and session.started:
+            return session
+        return None
+
+    @staticmethod
+    def decrypt_media(file_bytes: bytes, key: str, iv: str, hash_value: str) -> bytes:
+        """解密端到端加密媒体
+
+        配合事件媒体段中的 matrix_encrypted_file 字段（JWK）使用：
+        先按其中 url 下载密文，再用本方法解密。
+        """
+        if not NIO_AVAILABLE:
+            raise RuntimeError("matrix-nio is not installed")
+        from nio.crypto import decrypt_attachment
+
+        return decrypt_attachment(file_bytes, key, hash_value, iv)
+
+    async def _init_e2ee_session(self, account_name: str, account: MatrixAccountConfig):
+        """登录成功后初始化 E2EE 会话；不可用时降级明文并提示"""
+        logger = self._get_logger()
+        if not account.encryption_enabled:
+            return
+        if not NIO_AVAILABLE:
+            logger.warning(
+                i18n.t("matrix.e2ee_nio_missing", name=account_name, default="账户 {name} 已启用端到端加密，但 matrix-nio 未安装，将以明文模式运行。请执行: pip install matrix-nio[e2e]")
+            )
+            return
+
+        runtime = self._get_runtime(account_name)
+        device_id = self._resolve_device_id(account_name, account)
+        if not device_id:
+            logger.warning(
+                i18n.t("matrix.e2ee_device_id_missing", name=account_name, default="账户 {name} 无法获取 device_id（服务器 /whoami 未返回且未配置），端到端加密已禁用。可在配置中手动指定 device_id")
+            )
+            return
+        runtime["device_id"] = device_id
+        self._persist_device_id(account_name, account, device_id)
+
+        session = self._nio_sessions.get(account_name)
+        if session is not None and session.started:
+            return
+
+        session = NioSession(
+            account_name=account_name,
+            homeserver=account.homeserver or "https://matrix.org",
+            user_id=runtime.get("bot_id", ""),
+            device_id=device_id,
+            store_path=self._e2ee_store_path(account_name, account),
+            trust_all_devices=account.trust_all_devices,
+            logger=logger,
+        )
+        if await session.start(runtime.get("access_token", "")):
+            self._nio_sessions[account_name] = session
+            logger.info(
+                i18n.t("matrix.e2ee_session_started", name=account_name, device_id=device_id, default="账户 {name} 端到端加密会话已建立 (device: {device_id})")
+            )
+            if not account.trust_all_devices:
+                logger.info(
+                    i18n.t("matrix.e2ee_strict_mode", name=account_name, default="账户 {name} 运行在严格信任模式：未验证设备将无法解密新消息")
+                )
+        else:
+            logger.error(
+                i18n.t("matrix.e2ee_session_failed", name=account_name, error="start() returned False", default="账户 {name} 端到端加密会话初始化失败，将以明文模式运行: {error}")
+            )
+
+    async def _teardown_e2ee_session(self, account_name: str):
+        session = self._nio_sessions.pop(account_name, None)
+        if session is not None:
+            await session.close()
 
     # 账户加载使用框架默认实现（AccountConfigClass 模板 + 校验）；
     # 旧版单账户扁平配置迁移见 _migrate_legacy_config；缺少凭据的账户由 _login_if_needed 失败自然跳过。
@@ -553,6 +775,9 @@ class MatrixAdapter(BaseAdapter):
                     bot_id = result["data"].get("user_id", "")
                     runtime["bot_id"] = bot_id
                     runtime["access_token"] = account.access_token
+                    # Matrix v1.11+ 的 /whoami 会返回 device_id（E2EE 需要）
+                    if result["data"].get("device_id"):
+                        runtime["device_id"] = str(result["data"]["device_id"])
                     if converter:
                         converter.bot_user_id = bot_id
                     self.logger.info(i18n.t("matrix.authenticated", name=account_name, bot_id=bot_id, default="账户 {name} Matrix 已认证: {bot_id}"))
@@ -567,6 +792,10 @@ class MatrixAdapter(BaseAdapter):
                     "identifier": {"type": "m.id.user", "user": account.user_id},
                     "password": account.password,
                 }
+                # 复用已持久化的 device_id，避免每次重登产生新设备（E2EE 会话绑定设备）
+                existing_device_id = self._resolve_device_id(account_name, account)
+                if existing_device_id:
+                    login_data["device_id"] = existing_device_id
                 result = await self.call_api(
                     endpoint="/_matrix/client/v3/login",
                     method="POST",
@@ -579,6 +808,8 @@ class MatrixAdapter(BaseAdapter):
                     # 密码登录获得的 token 写入运行时状态，供后续 call_api 使用
                     runtime["access_token"] = token
                     runtime["bot_id"] = bot_id
+                    if result["data"].get("device_id"):
+                        runtime["device_id"] = str(result["data"]["device_id"])
                     if converter:
                         converter.bot_user_id = bot_id
                     self.logger.info(i18n.t("matrix.login_success", name=account_name, bot_id=bot_id, default="账户 {name} Matrix 登录成功: {bot_id}"))
@@ -589,6 +820,30 @@ class MatrixAdapter(BaseAdapter):
             except Exception as e:
                 self.logger.error(i18n.t("matrix.login_error", name=account_name, error=e, default="账户 {name} Matrix 登录失败: {error}"))
                 raise
+
+    async def _do_sync_request(self, account_name: str, timeout_ms: int = 30000) -> dict:
+        """执行一次同步请求，返回与 call_api 一致的结构
+
+        E2EE 会话活跃时走 nio（自动加解密与密钥管理），否则走 REST 长轮询。
+        """
+        session = self._nio_session_for(account_name)
+        if session is not None:
+            try:
+                data = await session.sync(timeout_ms)
+            except NioSessionError as e:
+                return {"status": "failed", "message": str(e), "http_status": e.status_code}
+            except Exception as e:  # noqa: BLE001
+                return {"status": "failed", "message": f"{type(e).__name__}: {e}", "http_status": 0}
+            if data is None:
+                return {"status": "failed", "message": "nio sync returned no data", "http_status": 0}
+            return {"status": "ok", "data": data}
+
+        runtime = self._get_runtime(account_name)
+        return await self.call_api(
+            endpoint=f"/_matrix/client/v3/sync?since={runtime.get('_next_batch') or ''}&timeout={timeout_ms}",
+            method="GET",
+            _account_id=account_name,
+        )
 
     async def _sync_loop(self, account_name: str):
         account = self.accounts.get(account_name)
@@ -616,11 +871,7 @@ class MatrixAdapter(BaseAdapter):
         while self._running:
             try:
                 runtime = self._get_runtime(account_name)
-                result = await self.call_api(
-                    endpoint=f"/_matrix/client/v3/sync?since={runtime.get('_next_batch') or ''}&timeout=30000",
-                    method="GET",
-                    _account_id=account_name,
-                )
+                result = await self._do_sync_request(account_name)
 
                 if result.get("status") != "ok":
                     message = result.get("message", "")
@@ -698,6 +949,14 @@ class MatrixAdapter(BaseAdapter):
                 account.access_token = old_token
                 raise
             self.logger.info(i18n.t("matrix.relogin_done", name=account_name, default="账户 {name} 重新登录成功"))
+            # access_token 已更换，用新 token 重建 E2EE 会话（store / device_id 复用）
+            account_cfg = self.accounts.get(account_name)
+            if account_cfg is not None and getattr(account_cfg, "encryption_enabled", False):
+                self.logger.info(
+                    i18n.t("matrix.e2ee_relogin_rebuild", name=account_name, default="账户 {name} 重新登录后正在重建端到端加密会话...")
+                )
+                await self._teardown_e2ee_session(account_name)
+                await self._init_e2ee_session(account_name, account_cfg)
             return True
         except Exception as e:
             self.logger.error(i18n.t("matrix.relogin_failed", name=account_name, error=e, default="账户 {name} 重新登录失败: {error}"))
@@ -721,14 +980,13 @@ class MatrixAdapter(BaseAdapter):
 
     async def _initial_sync(self, account_name: str) -> bool:
         runtime = self._get_runtime(account_name)
-        result = await self.call_api(
-            endpoint="/_matrix/client/v3/sync?timeout=0",
-            method="GET",
-            _account_id=account_name,
-        )
+        result = await self._do_sync_request(account_name, timeout_ms=0)
         if result.get("status") == "ok" and result.get("data"):
             data = result["data"]
-            runtime["_next_batch"] = data.get("next_batch", "")
+            # E2EE 模式下 next_batch 由 nio 维护，这里同步到 runtime 仅作展示
+            session = self._nio_session_for(account_name)
+            next_batch = session.next_batch if session else data.get("next_batch", "")
+            runtime["_next_batch"] = next_batch or data.get("next_batch", "")
             self.logger.info(
                 i18n.t("matrix.initial_sync_done", name=account_name, batch=runtime.get('_next_batch'), default="账户 {name} 初始同步完成, next_batch: {batch}")
             )
@@ -1101,6 +1359,9 @@ class MatrixAdapter(BaseAdapter):
                 )
                 continue
 
+            # E2EE 会话需在 sync 循环启动前就绪（nio 依赖它维护房间加密状态）
+            await self._init_e2ee_session(account_name, account)
+
             await self.emit_meta("connect", runtime.get("bot_id", ""))
             hb_coro = self._heartbeat_meta_loop(account_name)
             sync_coro = self._sync_loop(account_name)
@@ -1145,6 +1406,9 @@ class MatrixAdapter(BaseAdapter):
         if self._sync_tasks:
             await asyncio.gather(*self._sync_tasks.values(), return_exceptions=True)
         self._sync_tasks.clear()
+
+        for account_name in list(self._nio_sessions.keys()):
+            await self._teardown_e2ee_session(account_name)
 
         self._account_runtime.clear()
         try:

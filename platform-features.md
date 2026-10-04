@@ -6,7 +6,7 @@ MatrixAdapter 是基于 [Matrix协议](https://spec.matrix.org/) 构建的适配
 
 ## 文档信息
 
-- 对应模块版本: 1.0.0
+- 对应模块版本: 4.3.0
 - 维护者: ErisPulse
 
 ## 基本信息
@@ -49,6 +49,10 @@ enabled = true
 - `user_id`：Matrix用户ID（如 `@bot:matrix.org`），与 `password` 配合使用进行登录
 - `password`：Matrix用户密码，用于自动登录获取 access_token
 - `auto_accept_invites`：是否自动接受房间邀请，默认为 `true`
+- `encryption_enabled`：是否启用端到端加密，默认为 `false`
+- `trust_all_devices`：是否自动信任未验证设备（E2EE），默认为 `true`
+- `device_id`：设备 ID（E2EE，通常自动获取，无需填写）
+- `store_path`：加密会话存储目录（E2EE），默认为 `data/matrix/<账户名>`
 - `enabled`：是否启用该账户（可选，默认为true）
 
 **认证方式：**
@@ -329,6 +333,30 @@ async def handle_message(event):
 
 - 收到房间邀请（`invite` 状态的房间）时，如果 `auto_accept_invites` 配置为 `true`（默认），适配器会自动加入房间
 - 加入房间调用 `/_matrix/client/v3/join/{room_id}` 接口
+
+## 端到端加密（E2EE）
+
+适配器自 4.3.0 起原生支持加密房间的端到端加密（基于 matrix-nio[e2e] / vodozemac），`encryption_enabled = true` 启用。
+
+### 工作机制
+
+- **同步**：启用后同步走 nio E2EE 会话，设备密钥上传、一次性密钥补充、to-device 消息（Olm/Megolm 会话密钥分发）全部自动处理；timeline 中的 `m.room.encrypted` 事件自动解密为明文事件再走统一转换
+- **发送**：目标房间为加密房间时自动分享 Megolm 会话并加密载荷；解密失败的事件跳过并记录警告
+- **媒体**：加密房间中的媒体上传为端到端加密（`m.file.encrypted`）；接收侧媒体段携带 `matrix_encrypted_file`（JWK，含 url/key/iv/hashes），下载密文后可通过 `MatrixAdapter.decrypt_media(ciphertext, key, iv, sha256)` 解密
+- **设备**：`device_id` 自动解析（登录响应 → `/whoami` → 本地持久化），密码重登复用同一设备；`trust_all_devices = true`（默认）自动信任未验证设备（bot 场景惯例），`false` 为严格模式
+- **降级**：E2EE 未启用或 matrix-nio 未安装时自动回退明文 REST 路径，行为与旧版完全一致
+
+### 模块侧接口
+
+- 事件 Mixin：`event.is_encrypted()` 判断消息是否来自加密房间
+- 媒体段标记：`encrypted: true` 与 `matrix_encrypted_file`（JWK）
+- 解密辅助：`MatrixAdapter.decrypt_media(file_bytes, key, iv, hash_value) -> bytes`
+
+### 已知限制
+
+- 不支持交叉签名（cross-signing）与服务器端密钥备份（room key backup）
+- 本地会话存储目录（`store_path`，默认 `data/matrix/<账户名>`）删除后历史消息无法解密
+- 交互式 SAS（emoji）验证暂未支持，计划后续版本提供
 
 ## 使用示例
 

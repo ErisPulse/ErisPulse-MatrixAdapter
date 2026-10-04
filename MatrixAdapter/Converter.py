@@ -186,51 +186,67 @@ class MatrixConverter(BaseConverter):
 
         elif msgtype == "m.image":
             url = content.get("url", "")
-            segments.append({
-                "type": "image",
-                "data": {
-                    "url": url,
-                    "filename": body,
-                    "matrix_mxc": url,
-                    "info": content.get("info", {}),
-                },
-            })
+            enc_file = content.get("file") if not url else None
+            data = {
+                "filename": body,
+                "info": content.get("info", {}),
+            }
+            if enc_file:
+                data["url"] = enc_file.get("url", "")
+                data["matrix_encrypted_file"] = enc_file
+                data["encrypted"] = True
+            else:
+                data["url"] = url
+                data["matrix_mxc"] = url
+            segments.append({"type": "image", "data": data})
 
         elif msgtype == "m.audio":
             url = content.get("url", "")
-            segments.append({
-                "type": "voice",
-                "data": {
-                    "url": url,
-                    "filename": body,
-                    "matrix_mxc": url,
-                    "info": content.get("info", {}),
-                },
-            })
+            enc_file = content.get("file") if not url else None
+            data = {
+                "filename": body,
+                "info": content.get("info", {}),
+            }
+            if enc_file:
+                data["url"] = enc_file.get("url", "")
+                data["matrix_encrypted_file"] = enc_file
+                data["encrypted"] = True
+            else:
+                data["url"] = url
+                data["matrix_mxc"] = url
+            segments.append({"type": "voice", "data": data})
 
         elif msgtype == "m.video":
             url = content.get("url", "")
-            segments.append({
-                "type": "video",
-                "data": {
-                    "url": url,
-                    "filename": body,
-                    "matrix_mxc": url,
-                    "info": content.get("info", {}),
-                },
-            })
+            enc_file = content.get("file") if not url else None
+            data = {
+                "filename": body,
+                "info": content.get("info", {}),
+            }
+            if enc_file:
+                data["url"] = enc_file.get("url", "")
+                data["matrix_encrypted_file"] = enc_file
+                data["encrypted"] = True
+            else:
+                data["url"] = url
+                data["matrix_mxc"] = url
+            segments.append({"type": "video", "data": data})
 
         elif msgtype == "m.file":
             url = content.get("url", "")
-            segments.append({
-                "type": "file",
-                "data": {
-                    "url": url,
-                    "filename": body,
-                    "matrix_mxc": url,
-                    "info": content.get("info", {}),
-                },
-            })
+            enc_file = content.get("file") if not url else None
+            data = {
+                "filename": body,
+                "info": content.get("info", {}),
+            }
+            if enc_file:
+                data["url"] = enc_file.get("url", "")
+                data["matrix_encrypted_file"] = enc_file
+                data["encrypted"] = True
+            else:
+                data["url"] = url
+                data["matrix_mxc"] = url
+            segments.append({"type": "file", "data": data})
 
         elif msgtype == "m.location":
             geo_uri = content.get("geo_uri", "")

@@ -144,6 +144,41 @@ enabled = true
 
 ---
 
+### End-to-End Encryption (E2EE)
+
+The adapter natively supports end-to-end encryption for encrypted rooms (based on [matrix-nio](https://github.com/matrix-nio/matrix-nio), powered by [vodozemac](https://pypi.org/project/vodozemac/)): messages and media in encrypted rooms are automatically decrypted on receive and encrypted on send — no changes required in your modules.
+
+```toml
+[Matrix_Adapter.accounts.default]
+homeserver = "https://matrix.org"
+user_id = "@bot:matrix.org"
+password = "YOUR_PASSWORD"
+encryption_enabled = true       # Enable E2EE (default false)
+trust_all_devices = true        # Auto-trust unverified devices (default true)
+# device_id = "XXXXXXXXXX"      # Optional: specify manually only if the server doesn't report one
+# store_path = "data/matrix/default"  # Optional: crypto session store directory
+```
+
+**Encryption fields (per account):**
+- `encryption_enabled`: Enable E2EE, defaults to `false` (existing plaintext deployments are unaffected)
+- `trust_all_devices`: Automatically trust unverified devices, defaults to `true` (common bot practice). Set to `false` for strict mode — unverified devices will not receive room keys for new messages
+- `device_id`: Device ID, auto-resolved in most cases (login response → `/whoami` → persisted). Manual specification is only needed on servers that don't report it
+- `store_path`: Crypto session store directory, defaults to `data/matrix/<account_name>`
+
+**How it works:**
+- The `device_id` is resolved on login and persisted (in `store_path/device.json`); password re-login reuses the same device to avoid device pile-up
+- Sync runs through the E2EE session: device key upload, one-time key replenishment, to-device messages and Megolm decryption are handled automatically
+- Sending to an encrypted room automatically shares the Megolm session and encrypts the payload; media uploads in encrypted rooms are encrypted end-to-end (`m.file.encrypted`)
+- Modules can call `event.is_encrypted()` to check whether a message came from an encrypted room; encrypted media segments carry `matrix_encrypted_file` (JWK), and ciphertext can be decrypted with `MatrixAdapter.decrypt_media(bytes, key, iv, sha256)`
+
+**Important notes:**
+1. Requires Python >= 3.10 and `matrix-nio[e2e] >= 0.26` (installed automatically as a dependency)
+2. Cross-signing and server-side key backups are not supported; historical messages cannot be decrypted if the local store directory (`store_path`) is deleted — do not delete it
+3. Interactive SAS (emoji) verification is planned for a future release; the current trust model is "trust all devices" by default
+4. Events that fail to decryption are skipped with a warning logged
+
+---
+
 ### Matrix-Specific Features
 
 See the [Matrix platform features documentation](platform-features.md) for platform-specific capabilities, including the decentralized architecture, room concepts, Long Polling sync, MXC URIs, HTML rich text, reactions, message editing, and extension field descriptions.
@@ -212,6 +247,7 @@ async def handle_message(event):
     sender = event.get_matrix_sender()          # Get the sender ID
     is_edited = event.is_edited()               # Whether the message is an edit
     is_notice = event.is_notice()               # Whether it is an m.notice type
+    is_encrypted = event.is_encrypted()         # Whether it came from an E2EE room
 ```
 
 ### Notes
@@ -225,6 +261,7 @@ async def handle_message(event):
 7. Auto-accepting room invites is supported (can be disabled via the `auto_accept_invites` config).
 8. HTML-formatted messages are supported via the `.Html()` method.
 9. Message replies (`.Reply()`) and user mentions (`.At()`, `.AtAll()`) are supported.
+10. With end-to-end encryption enabled, do not delete the `store_path` directory (see the "End-to-End Encryption" section).
 
 ---
 
@@ -359,6 +396,41 @@ enabled = true
 
 ---
 
+## 端到端加密（E2EE）
+
+适配器原生支持加密房间的端到端加密（基于 [matrix-nio](https://github.com/matrix-nio/matrix-nio)，底层使用 [vodozemac](https://pypi.org/project/vodozemac/)）：加密房间的消息与媒体在接收时自动解密、发送时自动加密，模块无需任何改动。
+
+```toml
+[Matrix_Adapter.accounts.default]
+homeserver = "https://matrix.org"
+user_id = "@bot:matrix.org"
+password = "YOUR_PASSWORD"
+encryption_enabled = true       # 启用端到端加密（默认 false）
+trust_all_devices = true        # 自动信任未验证设备（默认 true）
+# device_id = "XXXXXXXXXX"      # 可选：仅在服务器不返回时手动指定
+# store_path = "data/matrix/default"  # 可选：加密会话存储目录
+```
+
+**加密相关配置（每个账户）：**
+- `encryption_enabled`：启用端到端加密，默认 `false`（存量明文部署不受影响）
+- `trust_all_devices`：自动信任未验证设备，默认 `true`（bot 场景惯例）；设为 `false` 进入严格模式——未验证设备将无法解密新消息
+- `device_id`：设备 ID，多数情况自动获取（登录响应 → `/whoami` → 本地持久化），仅服务器不返回时需手动指定
+- `store_path`：加密会话存储目录，默认 `data/matrix/<账户名>`
+
+**工作原理：**
+- 登录时解析并持久化 `device_id`（`store_path/device.json`），密码重登会复用同一设备，避免设备堆积
+- 同步走 E2EE 会话：设备密钥上传、一次性密钥补充、to-device 消息、Megolm 解密全部自动完成
+- 向加密房间发送消息时自动分享 Megolm 会话并加密载荷；加密房间的媒体上传为端到端加密（`m.file.encrypted`）
+- 模块可通过 `event.is_encrypted()` 判断消息是否来自加密房间；加密媒体段携带 `matrix_encrypted_file`（JWK），可配合 `MatrixAdapter.decrypt_media(bytes, key, iv, sha256)` 解密密文
+
+**注意事项：**
+1. 需要 Python >= 3.10 与 `matrix-nio[e2e] >= 0.26`（已作为依赖自动安装）
+2. 不支持交叉签名与服务器端密钥备份；本地会话目录（`store_path`）删除后历史消息将无法解密，请勿删除
+3. 交互式 SAS（emoji）验证计划在后续版本提供，当前默认信任策略为"自动信任所有设备"
+4. 解密失败的事件会被跳过并记录警告日志
+
+---
+
 ## Matrix平台特有功能
 
 请参考 [Matrix平台特性文档](platform-features.md) 了解Matrix平台的特有功能，包括去中心化架构、房间概念、Long Polling同步、MXC URI、HTML富文本、表情回应、消息编辑、扩展字段说明等内容。
@@ -427,19 +499,17 @@ async def handle_message(event):
     sender = event.get_matrix_sender()      # 获取发送者ID
     is_edited = event.is_edited()           # 是否为编辑消息
     is_notice = event.is_notice()           # 是否为 m.notice 类型
+    is_encrypted = event.is_encrypted()     # 是否来自端到端加密房间
 ```
 
 ## 注意事项：
 
-1. 确保在调用 `startup()` 前完成所有处理器的注册
-2. Matrix 是去中心化协议，用户ID格式为 `@user:server.domain`，房间ID格式为 `!room_id:server.domain`
-3. Matrix 不区分群聊和私聊，所有会话都是"房间"。适配器通过 DM 账户数据自动识别私聊
-4. 适配器使用 Long Polling（`/sync` API）获取事件，而非 WebSocket
-5. 媒体文件通过 `mxc://` URI 引用，适配器支持自动上传和下载
-6. 程序退出时请调用 `shutdown()` 确保资源释放
-7. 支持自动接受房间邀请（可通过 `auto_accept_invites` 配置关闭）
-8. 支持发送 HTML 格式消息，使用 `.Html()` 方法
-9. 支持消息回复（`.Reply()`）和用户提及（`.At()`、`.AtAll()`）
+1. Matrix 是去中心化协议，用户ID格式为 `@user:server.domain`，房间ID格式为 `!room_id:server.domain`
+2. Matrix 不区分群聊和私聊，所有会话都是"房间"。适配器通过 DM 账户数据自动识别私聊
+3. 适配器使用 Long Polling（`/sync` API）获取事件，而非 WebSocket
+4. 媒体文件通过 `mxc://` URI 引用，适配器支持自动上传和下载
+5. 支持自动接受房间邀请（可通过 `auto_accept_invites` 配置关闭）
+6. 启用端到端加密后，请勿删除 `store_path` 目录（详见「端到端加密」章节）
 
 ---
 

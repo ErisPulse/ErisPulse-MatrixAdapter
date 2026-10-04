@@ -1,12 +1,12 @@
 [project]
 name = "ErisPulse-MatrixAdapter"
-version = "4.2.0"
-description = "ErisPulse的Matrix协议适配模块"
+version = "4.3.0"
+description = "ErisPulse Matrix protocol adapter with native end-to-end encryption support"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [ { name = "wsu2059", email = "wsu2059@qq.com" } ]
-dependencies = []
+dependencies = [ "matrix-nio[e2e]>=0.26.0" ]
 
 [project.urls]
 "homepage" = "https://github.com/ErisPulse/ErisPulse-MatrixAdapter"
@@ -16,3 +16,7 @@ matrix = "MatrixAdapter:MatrixAdapter"
 
 [tool.setuptools.packages.find]
 include = [ "MatrixAdapter" ]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
