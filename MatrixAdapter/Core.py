@@ -1,4 +1,5 @@
 import asyncio
+import html as _html
 import mimetypes
 import uuid
 from dataclasses import dataclass, field
@@ -14,12 +15,63 @@ from ErisPulse.Core.i18n import i18n
 from .Converter import MatrixConverter
 from .NioSession import NIO_AVAILABLE, NioSession, NioSessionError
 
+
+def _forward_node_text(node: Dict) -> str:
+    """提取合并转发节点 content 中全部 text 段文本（段间直接连接）"""
+    data = node.get("data") or {}
+    return "".join(
+        str(seg.get("data", {}).get("text") or "")
+        for seg in (data.get("content") or [])
+        if isinstance(seg, dict) and seg.get("type") == "text"
+    )
+
+
+def _forward_nodes_plain(nodes, separator: str = "\n") -> str:
+    """合并转发节点降级纯文本：每条「昵称: 正文」"""
+    lines = []
+    for node in nodes if isinstance(nodes, list) else [nodes]:
+        if not isinstance(node, dict):
+            continue
+        data = node.get("data") or {}
+        nickname = str(data.get("nickname") or "").strip()
+        text = _forward_node_text(node).strip()
+        if nickname and text:
+            lines.append(f"{nickname}: {text}")
+        elif text:
+            lines.append(text)
+    return separator.join(lines)
+
+
+def _build_forward_matrix_html(nodes, title: str = "合并聊天记录") -> str:
+    """渲染合并转发为 Matrix formatted_body（白名单标签：p/strong/hr/blockquote/br）
+
+    Matrix HTML 白名单会剥离 details/summary 与内联样式，故用 blockquote 引用块形态。
+    """
+    blocks = []
+    for node in nodes if isinstance(nodes, list) else [nodes]:
+        if not isinstance(node, dict):
+            continue
+        data = node.get("data") or {}
+        nickname = str(data.get("nickname") or "").strip()
+        text = _forward_node_text(node).strip()
+        if not text:
+            continue
+        header = f"<strong>{_html.escape(nickname)}</strong><br/>" if nickname else ""
+        body = _html.escape(text).replace("\n", "<br/>")
+        blocks.append(f"<blockquote>{header}{body}</blockquote>")
+    if not blocks:
+        return ""
+    return (
+        f"<p><strong>{_html.escape(title)}</strong></p>"
+        + "<hr/>".join(blocks)
+    )
+
 try:
     from ErisPulse.runtime.tasks import spawn_background
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "4.3.0"
+__version__ = "4.4.0"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
@@ -183,7 +235,54 @@ class MatrixAdapter(BaseAdapter):
                 [{"type": "html", "data": {"html": html, "fallback": fallback}}]
             )
 
+        def MergeForward(self, nodes, title: str = "合并聊天记录"):
+            """发送合并转发消息（Matrix formatted_body：标题 + 每条 blockquote 引用块）
+
+            :param nodes: go-cqhttp 扩展的 OneBot v11 合并转发节点数组（或单节点 dict）
+            :param title: 标题
+            :return: asyncio.Task
+            """
+            if isinstance(nodes, dict):
+                nodes = [nodes]
+            return asyncio.create_task(
+                self._do_send_merge_forward(
+                    [n for n in nodes if isinstance(n, dict)], title
+                )
+            )
+
+        async def _do_send_merge_forward(self, nodes, title: str = "合并聊天记录"):
+            html = _build_forward_matrix_html(nodes, title)
+            if not html:
+                return self._adapter.make_error(
+                    retcode=10006, message="MergeForward: 节点无有效文本内容"
+                )
+            return await self._do_send_raw_ob12(
+                [
+                    {
+                        "type": "html",
+                        "data": {
+                            "html": html,
+                            "fallback": _forward_nodes_plain(nodes),
+                        },
+                    }
+                ]
+            )
+
         def Raw_ob12(self, message: List[Dict], **kwargs):
+            # node 段解析：纯 node 列表自动路由合并转发；混合列表降级为纯文本
+            if message and all(
+                isinstance(seg, dict) and seg.get("type") == "node" for seg in message
+            ):
+                return asyncio.create_task(
+                    self._do_send_merge_forward([seg for seg in message])
+                )
+            message = [
+                {"type": "text", "data": {"text": _forward_nodes_plain(seg)}}
+                if isinstance(seg, dict) and seg.get("type") == "node"
+                else seg
+                for seg in message
+            ]
+
             async def _send():
                 return await self._do_send_raw_ob12(message, **kwargs)
 
