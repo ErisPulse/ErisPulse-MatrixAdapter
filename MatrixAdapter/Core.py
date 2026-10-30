@@ -71,7 +71,7 @@ try:
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "4.4.0"
+__version__ = "4.5.0"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
@@ -115,7 +115,12 @@ class MatrixAccountConfig(BotAccountConfig):
         metadata={
             "description": {"i18n": "matrix.password", "default": "密码（用于密码登录）"},
             "secret": True,
-            "ui": {"widget": "password", "group": "basic", "order": 4},
+            "ui": {
+                "widget": "password",
+                "group": "basic",
+                "order": 4,
+                "disabled_if": {"field": "access_token", "op": "truthy"},
+            },
         },
     )
     auto_accept_invites: bool = field(
@@ -136,21 +141,37 @@ class MatrixAccountConfig(BotAccountConfig):
         default=True,
         metadata={
             "description": {"i18n": "matrix.trust_all_devices", "default": "自动信任未验证设备（关闭后不向未验证设备分发消息密钥）"},
-            "ui": {"widget": "switch", "group": "encryption", "order": 7},
+            "ui": {
+                "widget": "switch",
+                "group": "encryption",
+                "order": 7,
+                "show_if": {"field": "encryption_enabled", "op": "eq", "value": True},
+            },
         },
     )
     device_id: str = field(
         default="",
         metadata={
             "description": {"i18n": "matrix.device_id", "default": "设备 ID（通常自动获取，仅在服务器不支持时手动指定）"},
-            "ui": {"widget": "text", "group": "encryption", "order": 8},
+            "ui": {
+                "widget": "text",
+                "group": "encryption",
+                "order": 8,
+                "show_if": {"field": "encryption_enabled", "op": "eq", "value": True},
+            },
         },
     )
     store_path: str = field(
         default="",
         metadata={
             "description": {"i18n": "matrix.store_path", "default": "加密会话存储目录（默认 data/matrix/<账户名>，请勿删除）"},
-            "ui": {"widget": "text", "group": "encryption", "order": 9, "placeholder": {"i18n": "matrix.store_path.ph", "default": "data/matrix/<账户名>"}},
+            "ui": {
+                "widget": "text",
+                "group": "encryption",
+                "order": 9,
+                "placeholder": {"i18n": "matrix.store_path.ph", "default": "data/matrix/<账户名>"},
+                "show_if": {"field": "encryption_enabled", "op": "eq", "value": True},
+            },
         },
     )
 
