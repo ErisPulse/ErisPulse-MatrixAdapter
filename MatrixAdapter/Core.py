@@ -1,10 +1,14 @@
 import asyncio
+import base64
 import html as _html
 import mimetypes
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 from ErisPulse.Core import client
 from ErisPulse.Core.Bases.adapter import BaseAdapter
@@ -14,6 +18,55 @@ from ErisPulse.Core.i18n import i18n
 
 from .Converter import MatrixConverter
 from .NioSession import NIO_AVAILABLE, NioSession, NioSessionError
+
+
+# 常见媒体格式的魔数前缀
+_MEDIA_MAGIC_PREFIXES = (
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",
+    b"GIF87a",
+    b"GIF89a",
+    b"OggS",
+    b"fLaC",
+    b"ID3",
+    b"RIFF",
+    b"%PDF",
+    b"PK\x03\x04",
+    b"\x1a\x45\xdf\xa3",
+)
+
+
+def _looks_like_media_bytes(data: bytes) -> bool:
+    """按魔数判断 bytes 是否为常见媒体/文件格式"""
+    if any(data.startswith(prefix) for prefix in _MEDIA_MAGIC_PREFIXES):
+        return True
+    if len(data) > 12 and data[4:8] == b"ftyp":
+        return True
+    return len(data) > 2 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0
+
+
+def _decode_base64_media(value: str) -> Optional[bytes]:
+    """标准 base64 字符串解码为 bytes（解码结果须通过魔数校验）；不满足返回 None"""
+    if not value or value.strip() != value:
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except Exception:
+        return None
+    return decoded if _looks_like_media_bytes(decoded) else None
+
+
+def _decode_data_uri(value: str) -> Optional[bytes]:
+    """data: URI 解码为 bytes；格式不合法或解码失败返回 None"""
+    head, sep, payload = value.partition(",")
+    if not sep or not head.startswith("data:"):
+        return None
+    if head.endswith(";base64"):
+        try:
+            return base64.b64decode(payload, validate=True)
+        except Exception:
+            return None
+    return unquote(payload).encode("utf-8")
 
 
 def _forward_node_text(node: Dict) -> str:
@@ -71,7 +124,7 @@ try:
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "4.5.0"
+__version__ = "4.5.1"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
@@ -237,7 +290,7 @@ class MatrixAdapter(BaseAdapter):
             return self.Raw_ob12([{"type": "image", "data": {"file": file}}])
 
         def Voice(self, file):
-            return self.Raw_ob12([{"type": "voice", "data": {"file": file}}])
+            return self.Raw_ob12([{"type": "audio", "data": {"file": file}}])
 
         def Video(self, file):
             return self.Raw_ob12([{"type": "video", "data": {"file": file}}])
@@ -338,13 +391,15 @@ class MatrixAdapter(BaseAdapter):
                     if user_id:
                         text_parts.append(user_id)
                         segment_mentions.append(user_id)
-                elif seg_type in ("image", "voice", "video", "file"):
+                elif seg_type in ("image", "voice", "audio", "video", "file"):
                     file = data.get("file", data.get("url", ""))
                     if file:
                         media_file = file
                         media_type = seg_type
                         if data.get("filename"):
                             media_filename = data["filename"]
+                else:
+                    self._adapter._get_logger().warning(f"未处理的消息段类型，已跳过: {seg_type}")
 
             # 基类内置修饰器：_at_user_ids / _at_all
             if self._at_user_ids:
@@ -373,6 +428,7 @@ class MatrixAdapter(BaseAdapter):
                         ct = {
                             "image": "image/png",
                             "voice": "audio/ogg",
+                            "audio": "audio/mpeg",
                             "video": "video/mp4",
                             "file": "application/octet-stream",
                         }.get(media_type, "application/octet-stream")
@@ -397,7 +453,10 @@ class MatrixAdapter(BaseAdapter):
                         retcode=32000, message="媒体上传失败", raw=None
                     )
                 content = self._build_media_content(
-                    media_type, mxc_uri, media_filename or full_text, file_dict=file_dict
+                    media_type,
+                    mxc_uri,
+                    media_filename or self._default_media_name(media_type),
+                    file_dict=file_dict,
                 )
             elif (
                 media_file
@@ -428,19 +487,39 @@ class MatrixAdapter(BaseAdapter):
                         retcode=32000, message="媒体上传失败", raw=None
                     )
                 mimetype = upload_ct
+                url_name = os.path.basename(unquote(urlparse(media_file).path))
                 content = self._build_media_content(
                     media_type,
                     mxc_uri,
-                    media_filename or full_text,
+                    url_name or media_filename or full_text,
                     mimetype=mimetype,
                     file_dict=file_dict,
                 )
             elif media_file:
-                path = Path(str(media_file))
-                if path.is_file():
-                    file_bytes = path.read_bytes()
+                resolve_error = ""
+                resolved_bytes = None
+                resolved_name = None
+                value = str(media_file)
+                if value.startswith("file://"):
+                    value = url2pathname(urlparse(value).path)
+                if value.startswith("data:"):
+                    resolved_bytes = _decode_data_uri(value)
+                    if resolved_bytes is None:
+                        resolve_error = f"data: URI 解码失败({media_type})"
+                else:
+                    resolved_bytes = _decode_base64_media(value)
+                path = Path(value)
+                if resolved_bytes is None and path.is_file():
+                    try:
+                        resolved_bytes = path.read_bytes()
+                        resolved_name = path.name
+                    except OSError as e:
+                        resolve_error = f"媒体文件读取失败({media_type}): {e}"
+                elif resolved_bytes is None and not resolve_error:
+                    resolve_error = f"媒体文件不存在({media_type}): {value}"
+                if resolved_bytes is not None:
                     guessed_type, _ = mimetypes.guess_type(str(path))
-                    mxc_uri, file_dict = await _upload_bytes(file_bytes, guessed_type)
+                    mxc_uri, file_dict = await _upload_bytes(resolved_bytes, guessed_type)
                     if not mxc_uri:
                         return self._adapter.make_error(
                             retcode=32000, message="媒体上传失败", raw=None
@@ -448,12 +527,26 @@ class MatrixAdapter(BaseAdapter):
                     content = self._build_media_content(
                         media_type,
                         mxc_uri,
-                        media_filename or path.name or full_text,
+                        media_filename or resolved_name or self._default_media_name(media_type),
                         mimetype=guessed_type,
                         file_dict=file_dict,
                     )
 
+            skipped_note = ""
+            if content is None and media_file is not None:
+                self._adapter._get_logger().warning(
+                    f"媒体段解析失败，已跳过: media_type={media_type}, file={str(media_file)[:200]}"
+                )
+                skipped_note = f"[跳过媒体段: {media_type}]"
+
             if content is None:
+                has_text = bool("".join(text_parts).strip()) or bool(fallback_text) or bool(html_parts)
+                if skipped_note and not has_text:
+                    return self._adapter.make_error(
+                        retcode=10002,
+                        message=f"媒体段解析失败且无可发送内容: media_type={media_type}",
+                        raw=None,
+                    )
                 content = {
                     "msgtype": "m.notice" if is_notice else "m.text",
                     "body": full_text,
@@ -487,7 +580,7 @@ class MatrixAdapter(BaseAdapter):
                         i18n.t("matrix.e2ee_send_failed", name=account_name, error=err, default="账户 {name} 加密发送失败: {error}")
                     )
                     return self._adapter.make_error(retcode=34000, message=err, raw=None)
-                return self._adapter.make_response(
+                resp = self._adapter.make_response(
                     status="ok",
                     retcode=0,
                     data={"event_id": event_id, "message_id": event_id},
@@ -495,15 +588,32 @@ class MatrixAdapter(BaseAdapter):
                     message="",
                     raw={"event_id": event_id},
                 )
+                if skipped_note:
+                    resp["message"] = skipped_note
+                return resp
 
             txn_id = str(uuid.uuid4())
             endpoint = (
                 f"/_matrix/client/v3/rooms/{target_room}/send/m.room.message/{txn_id}"
             )
 
-            return await self._adapter.call_api(
+            result = await self._adapter.call_api(
                 endpoint=endpoint, method="PUT", _account_id=account_id, **content
             )
+            if skipped_note:
+                result["message"] = ((result.get("message") or "") + " " + skipped_note).strip()
+            return result
+
+        @staticmethod
+        def _default_media_name(media_type: str) -> str:
+            """媒体类型的默认文件名（真实扩展名）"""
+            return {
+                "image": "image.png",
+                "voice": "voice.ogg",
+                "audio": "audio.mp3",
+                "video": "video.mp4",
+                "file": "file.bin",
+            }.get(media_type, "file.bin")
 
         def _build_media_content(
             self, media_type: str, mxc_uri: str, body: str, mimetype: str = None,
@@ -512,6 +622,7 @@ class MatrixAdapter(BaseAdapter):
             msgtype_map = {
                 "image": "m.image",
                 "voice": "m.audio",
+                "audio": "m.audio",
                 "video": "m.video",
                 "file": "m.file",
             }
@@ -519,6 +630,7 @@ class MatrixAdapter(BaseAdapter):
                 mimetype_map = {
                     "image": "image/png",
                     "voice": "audio/ogg",
+                    "audio": "audio/mpeg",
                     "video": "video/mp4",
                     "file": "application/octet-stream",
                 }
@@ -1225,6 +1337,7 @@ class MatrixAdapter(BaseAdapter):
             content_type_map = {
                 "image": "image/png",
                 "voice": "audio/ogg",
+                "audio": "audio/mpeg",
                 "video": "video/mp4",
                 "file": "application/octet-stream",
             }
