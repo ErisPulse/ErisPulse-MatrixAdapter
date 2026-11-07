@@ -69,6 +69,32 @@ def _decode_data_uri(value: str) -> Optional[bytes]:
     return unquote(payload).encode("utf-8")
 
 
+def _geo_uri_from_data(data: dict) -> str:
+    """由 OB12 location 段 data 构建 geo URI（优先平台扩展 matrix_geo_uri）"""
+    custom = str(data.get("matrix_geo_uri") or "").strip()
+    if custom:
+        return custom
+    try:
+        latitude = float(data.get("latitude", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        latitude = 0.0
+    try:
+        longitude = float(data.get("longitude", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        longitude = 0.0
+    return f"geo:{latitude},{longitude}"
+
+
+def _build_location_content(data: dict, fallback_body: str = " ") -> dict:
+    """OB12 location 段 → Matrix m.location 事件 content"""
+    body = str(data.get("text") or data.get("title") or "").strip() or fallback_body
+    return {
+        "msgtype": "m.location",
+        "body": body,
+        "geo_uri": _geo_uri_from_data(data),
+    }
+
+
 def _forward_node_text(node: Dict) -> str:
     """提取合并转发节点 content 中全部 text 段文本（段间直接连接）"""
     data = node.get("data") or {}
@@ -124,7 +150,7 @@ try:
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "4.5.1"
+__version__ = "4.6.0"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
@@ -371,6 +397,7 @@ class MatrixAdapter(BaseAdapter):
             is_notice = False
             fallback_text = ""
             segment_mentions = []
+            location_data = None
 
             for segment in message:
                 seg_type = segment.get("type")
@@ -398,6 +425,8 @@ class MatrixAdapter(BaseAdapter):
                         media_type = seg_type
                         if data.get("filename"):
                             media_filename = data["filename"]
+                elif seg_type == "location":
+                    location_data = data
                 else:
                     self._adapter._get_logger().warning(f"未处理的消息段类型，已跳过: {seg_type}")
 
@@ -411,10 +440,17 @@ class MatrixAdapter(BaseAdapter):
             full_html = "".join(html_parts) if html_parts else None
 
             ctx = self.send_context
-            target_room = ctx.get("target_id")
             account_id = ctx.get("account_id")
             # 多账户：解析当前发送所用账户（用于媒体上传/下载与发送）
             account_name, _ = self._adapter._resolve_account(account_id)
+            # 目标解析：群发 "!room" 直用；私聊 "user" 反查 DM 房间表
+            target_room, resolve_error = self._adapter._resolve_target_room(
+                ctx.get("target_id"), account_name
+            )
+            if not target_room:
+                return self._adapter.make_error(
+                    retcode=10003, message=resolve_error, raw=None
+                )
             # E2EE：目标房间为加密房间且会话就绪时，媒体加密上传 + 事件加密发送
             session = self._adapter._nio_session_for(account_name)
             room_encrypted = bool(session and target_room and session.is_room_encrypted(target_room))
@@ -541,19 +577,24 @@ class MatrixAdapter(BaseAdapter):
 
             if content is None:
                 has_text = bool("".join(text_parts).strip()) or bool(fallback_text) or bool(html_parts)
-                if skipped_note and not has_text:
+                if skipped_note and not has_text and location_data is None:
                     return self._adapter.make_error(
                         retcode=10002,
                         message=f"媒体段解析失败且无可发送内容: media_type={media_type}",
                         raw=None,
                     )
-                content = {
-                    "msgtype": "m.notice" if is_notice else "m.text",
-                    "body": full_text,
-                }
-                if full_html:
-                    content["format"] = "org.matrix.custom.html"
-                    content["formatted_body"] = full_html
+                if location_data is not None and not has_text:
+                    # 纯位置消息：位置事件即主事件（m.location 无法与 m.text 合并进同一事件）
+                    content = _build_location_content(location_data)
+                    location_data = None
+                else:
+                    content = {
+                        "msgtype": "m.notice" if is_notice else "m.text",
+                        "body": full_text,
+                    }
+                    if full_html:
+                        content["format"] = "org.matrix.custom.html"
+                        content["formatted_body"] = full_html
 
             # 基类内置 Reply：_reply_message_id
             if self._reply_message_id:
@@ -590,6 +631,16 @@ class MatrixAdapter(BaseAdapter):
                 )
                 if skipped_note:
                     resp["message"] = skipped_note
+                if location_data is not None:
+                    # 与文本/媒体共存的位置段：拆分为独立事件（规范 §6.3.3 顺序拆分）
+                    ok_loc, _, err_loc = await session.send_event(
+                        target_room, "m.room.message",
+                        _build_location_content(location_data),
+                    )
+                    if not ok_loc:
+                        resp["message"] = (
+                            (resp.get("message") or "") + f" [位置事件发送失败: {err_loc}]"
+                        ).strip()
                 return resp
 
             txn_id = str(uuid.uuid4())
@@ -602,6 +653,18 @@ class MatrixAdapter(BaseAdapter):
             )
             if skipped_note:
                 result["message"] = ((result.get("message") or "") + " " + skipped_note).strip()
+            if location_data is not None:
+                txn_loc = str(uuid.uuid4())
+                loc_result = await self._adapter.call_api(
+                    endpoint=f"/_matrix/client/v3/rooms/{target_room}/send/m.room.message/{txn_loc}",
+                    method="PUT", _account_id=account_id,
+                    **_build_location_content(location_data),
+                )
+                if loc_result.get("status") != "ok":
+                    result["message"] = (
+                        (result.get("message") or "")
+                        + f" [位置事件发送失败: {loc_result.get('message', '')}]"
+                    ).strip()
             return result
 
         @staticmethod
@@ -876,6 +939,33 @@ class MatrixAdapter(BaseAdapter):
                 "device_id": "",
             }
         return self._account_runtime[name]
+
+    def _resolve_target_room(self, target: str, account_name: str) -> tuple:
+        """解析标准发送目标为 Matrix 房间 ID
+
+        会话类型映射（session-types 标准）：Send.To("group", x) 的 x 是房间 ID，
+        Send.To("user", x) 的 x 是用户 ID——Matrix 中私聊实际仍发到房间：
+        - "!room:server" → 房间 ID，直接使用
+        - "@user:server" → 反查 DM 房间表（_dm_rooms: room_id → user_id）得到私聊房间
+        - 其余形态无法定位 Matrix 房间
+
+        :return: (room_id 或 None, 错误描述或空串)
+        """
+        target = str(target or "").strip()
+        if not target:
+            return None, "发送目标为空"
+        if target.startswith("!"):
+            return target, ""
+        if target.startswith("@"):
+            dm_rooms = self._get_runtime(account_name).get("_dm_rooms", {})
+            for room_id, user_id in dm_rooms.items():
+                if user_id == target:
+                    return room_id, ""
+            return None, (
+                f"未找到与 {target} 的私聊房间；请改用房间 ID（! 开头）发送，"
+                "或先由对方发起私聊以建立 DM 会话"
+            )
+        return None, f"无法识别的发送目标: {target}（需为 ! 开头的房间 ID 或 @ 开头的用户 ID）"
 
     # ==================== 端到端加密（E2EE） ====================
 
@@ -1415,14 +1505,21 @@ class MatrixAdapter(BaseAdapter):
             data = dict(raw_response)
             data["message_id"] = message_id
 
+            # retcode 必须为 int（api-response §2）；Matrix 的 errcode 是字符串
+            # （如 "M_FORBIDDEN"），恒降级为 34xxx 平台错误段，原始 errcode 保留在
+            # message 与 matrix_raw 中
+            errcode = raw_response.get("errcode", "")
             response = self.make_response(
                 status="ok" if success else "failed",
-                retcode=0 if success else raw_response.get("errcode", 34000),
+                retcode=0 if success else 34000,
                 data=data,
                 message_id=message_id,
                 message=""
                 if success
-                else raw_response.get("error", f"HTTP {resp.status}"),
+                else (
+                    raw_response.get("error")
+                    or (f"{errcode} (HTTP {resp.status})" if errcode else f"HTTP {resp.status}")
+                ),
                 raw=raw_response,
             )
             response["matrix_raw"] = raw_response
@@ -1461,12 +1558,13 @@ class MatrixAdapter(BaseAdapter):
         """Matrix 标准 API 动作实现（ApiDSL，基于 Matrix Client-Server API）
 
         {!--< tips >!--}
-        1. get_self_info → GET /account/whoami
+        1. get_self_info → GET /account/whoami + GET /profile/{self}
         2. get_user_info → GET /profile/{userId}
-        3. get_group_info → GET /rooms/{roomId}/state/m.room.name
+        3. get_group_info → GET /rooms/{roomId}/state/m.room.name；set_group_name → PUT 同端点
         4. get_group_list → GET /joined_rooms；get_group_member_list → GET /rooms/{roomId}/members
-        5. delete_message → PUT /rooms/{roomId}/redact/{eventId}/{txn}（登记表补全 roomId）
-        6. leave_group → POST /rooms/{roomId}/leave
+        5. get_group_member_info → GET /rooms/{roomId}/state/m.room.member/{userId}
+        6. delete_message → PUT /rooms/{roomId}/redact/{eventId}/{txn}（登记表补全 roomId）
+        7. leave_group → POST /rooms/{roomId}/leave；get_friend_list 不支持（10002，Matrix 无好友概念）
         {!--< /tips >!--}
         """
 
@@ -1478,7 +1576,24 @@ class MatrixAdapter(BaseAdapter):
             if r.get("status") != "ok":
                 return r
             u = r.get("data") or {}
-            r["data"] = {"user_id": str(u.get("user_id", "")), "user_name": str(u.get("user_id", "")).split(":")[0].lstrip("@")}
+            user_id = str(u.get("user_id", ""))
+            local_name = user_id.split(":")[0].lstrip("@")
+            # whoami 不含资料，补 GET /profile 取 displayname/avatar
+            displayname, avatar_url = "", ""
+            if user_id:
+                p = await self._adapter.call_api(
+                    f"/_matrix/client/v3/profile/{user_id}", method="GET",
+                    _account_id=self._account_id,
+                )
+                if p.get("status") == "ok" and isinstance(p.get("data"), dict):
+                    displayname = str(p["data"].get("displayname", "") or "")
+                    avatar_url = str(p["data"].get("avatar_url", "") or "")
+            r["data"] = {
+                "user_id": user_id,
+                "user_name": local_name,
+                "user_displayname": displayname or local_name,
+                "user_avatar": avatar_url,
+            }
             return r
 
         async def get_user_info(self, user_id: str) -> dict:
@@ -1489,21 +1604,30 @@ class MatrixAdapter(BaseAdapter):
             if r.get("status") != "ok":
                 return r
             u = r.get("data") or {}
+            displayname = str(u.get("displayname", "") or "")
             r["data"] = {
                 "user_id": str(user_id),
-                "user_name": u.get("displayname", ""),
+                "user_name": displayname,
+                "user_displayname": displayname,
+                "user_remark": "",
                 "user_avatar": u.get("avatar_url", ""),
             }
             return r
 
-        async def get_group_info(self, room_id: str) -> dict:
+        async def get_friend_list(self) -> dict:
+            # Matrix 协议无好友概念（关系即房间共享成员），明确声明不支持
+            return self._adapter.make_error(
+                retcode=10002, message="Matrix 平台无好友概念，不支持 get_friend_list", raw=None
+            )
+
+        async def get_group_info(self, group_id: str) -> dict:
             r = await self._adapter.call_api(
-                f"/_matrix/client/v3/rooms/{room_id}/state/m.room.name", method="GET",
+                f"/_matrix/client/v3/rooms/{group_id}/state/m.room.name", method="GET",
                 _account_id=self._account_id,
             )
             if r.get("status") != "ok":
                 return r
-            r["data"] = {"group_id": str(room_id), "group_name": (r.get("data") or {}).get("name", "")}
+            r["data"] = {"group_id": str(group_id), "group_name": (r.get("data") or {}).get("name", "")}
             return r
 
         async def get_group_list(self) -> dict:
@@ -1516,9 +1640,25 @@ class MatrixAdapter(BaseAdapter):
             r["data"] = [{"group_id": str(x)} for x in rooms]
             return r
 
-        async def get_group_member_list(self, room_id: str) -> dict:
+        async def get_group_member_info(self, group_id: str, user_id: str) -> dict:
             r = await self._adapter.call_api(
-                f"/_matrix/client/v3/rooms/{room_id}/members",
+                f"/_matrix/client/v3/rooms/{group_id}/state/m.room.member/{user_id}",
+                method="GET", _account_id=self._account_id,
+            )
+            if r.get("status") != "ok":
+                return r
+            u = r.get("data") or {}
+            displayname = str(u.get("displayname", "") or "")
+            r["data"] = {
+                "user_id": str(user_id),
+                "user_name": displayname or str(user_id).split(":")[0].lstrip("@"),
+                "user_displayname": displayname,
+            }
+            return r
+
+        async def get_group_member_list(self, group_id: str) -> dict:
+            r = await self._adapter.call_api(
+                f"/_matrix/client/v3/rooms/{group_id}/members",
                 method="GET", _account_id=self._account_id,
             )
             if r.get("status") != "ok":
@@ -1526,14 +1666,32 @@ class MatrixAdapter(BaseAdapter):
             chunk = (r.get("data") or {}).get("chunk", []) or []
             members = []
             for m in chunk:
-                if isinstance(m, dict) and m.get("sender"):
-                    members.append({"user_id": str(m["sender"])})
+                if not (isinstance(m, dict) and m.get("sender")):
+                    continue
+                m_content = m.get("content") or {}
+                # OB12 语义为当前在群成员：过滤 leave/ban（invite 视为待加入，保留）
+                if m_content.get("membership") not in (None, "join", "invite"):
+                    continue
+                sender = str(m["sender"])
+                displayname = str(m_content.get("displayname", "") or "")
+                members.append({
+                    "user_id": sender,
+                    "user_name": displayname or sender.split(":")[0].lstrip("@"),
+                    "user_displayname": displayname,
+                })
             r["data"] = members
             return r
 
-        async def leave_group(self, room_id: str) -> dict:
+        async def set_group_name(self, group_id: str, group_name: str) -> dict:
             return await self._adapter.call_api(
-                f"/_matrix/client/v3/rooms/{room_id}/leave", method="POST",
+                f"/_matrix/client/v3/rooms/{group_id}/state/m.room.name",
+                method="PUT", _account_id=self._account_id,
+                name=str(group_name),
+            )
+
+        async def leave_group(self, group_id: str) -> dict:
+            return await self._adapter.call_api(
+                f"/_matrix/client/v3/rooms/{group_id}/leave", method="POST",
                 _account_id=self._account_id,
             )
 
@@ -1560,7 +1718,8 @@ class MatrixAdapter(BaseAdapter):
         async def get_supported_actions(self) -> dict:
             actions = {
                 "get_self_info", "get_user_info", "get_group_info", "get_group_list",
-                "get_group_member_list", "leave_group", "delete_message",
+                "get_group_member_info", "get_group_member_list", "set_group_name",
+                "leave_group", "delete_message",
                 "get_status", "get_version", "get_supported_actions",
             }
             return self._adapter.make_response(data=sorted(actions))

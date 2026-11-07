@@ -66,6 +66,16 @@ class MatrixConverter(BaseConverter):
         msgtype = content.get("msgtype", "m.text")
 
         message_segments = self._parse_message_content(content, raw_event)
+
+        # m.mentions（Matrix v1.11+ 规范）→ 标准 mention 段；@room 记为 user_id="all"
+        mentions = content.get("m.mentions") or {}
+        mentioned_ids = list(mentions.get("user_ids") or [])
+        if mentions.get("room"):
+            mentioned_ids.append("all")
+        for uid in mentioned_ids:
+            if isinstance(uid, str) and uid:
+                message_segments.append({"type": "mention", "data": {"user_id": uid}})
+
         alt_message = self._generate_alt_message(message_segments)
 
         base_event["message"] = message_segments
@@ -214,7 +224,8 @@ class MatrixConverter(BaseConverter):
             else:
                 data["url"] = url
                 data["matrix_mxc"] = url
-            segments.append({"type": "voice", "data": data})
+            # 标准消息段名为 audio（OB12/ErisPulse 规范；"voice" 是发送方法名，不是段名）
+            segments.append({"type": "audio", "data": data})
 
         elif msgtype == "m.video":
             url = content.get("url", "")
@@ -250,11 +261,21 @@ class MatrixConverter(BaseConverter):
 
         elif msgtype == "m.location":
             geo_uri = content.get("geo_uri", "")
+            # geo URI 形如 geo:37.78,-122.39;u=35（可带海拔/精度参数，取前两个坐标）
+            latitude, longitude = 0.0, 0.0
+            if geo_uri.startswith("geo:"):
+                coords = geo_uri[4:].split(";")[0].split(",")
+                if len(coords) >= 2:
+                    try:
+                        latitude = float(coords[0].strip())
+                        longitude = float(coords[1].strip())
+                    except ValueError:
+                        pass
             segments.append({
                 "type": "location",
                 "data": {
-                    "latitude": 0.0,
-                    "longitude": 0.0,
+                    "latitude": latitude,
+                    "longitude": longitude,
                     "matrix_geo_uri": geo_uri,
                     "text": body,
                 },
@@ -285,8 +306,11 @@ class MatrixConverter(BaseConverter):
                 parts.append(data.get("text", ""))
             elif seg_type == "image":
                 parts.append("[图片]")
-            elif seg_type == "voice":
+            elif seg_type in ("audio", "voice"):
                 parts.append("[语音]")
+            elif seg_type == "mention":
+                mid = str(data.get("user_id", ""))
+                parts.append(mid if mid.startswith("@") else f"@{mid}")
             elif seg_type == "video":
                 parts.append("[视频]")
             elif seg_type == "file":

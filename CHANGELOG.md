@@ -4,6 +4,39 @@
 
 ---
 
+## [4.6.0] - 2026/11/06
+
+### 新增（OneBot12 协议映射对齐）
+
+- **标准私聊发送路径**：`Send.To("user", "@user:server")` 现在自动反查 DM 房间表得到私聊房间；
+  `!room:server` 房间 ID 直接使用；无法定位房间时返回标准错误 `retcode=10003`（此前用户 ID 被直接当
+  房间 ID 使用，请求必然 404）
+- **标准 API 动作补齐**：新增 `set_group_name`（PUT m.room.name）、`get_group_member_info`
+  （GET m.room.member）；`get_friend_list` 明确返回 `retcode=10002`（Matrix 无好友概念）
+- **位置消息双向支持**：接收侧从 geo URI 解析出 latitude/longitude（此前恒为 0.0）；发送侧支持标准
+  `location` 段（转 m.location 事件，与文本共存时按序拆分为独立事件）
+- 接收侧解析 `m.mentions`（Matrix v1.11+）为标准 `mention` 段，`@room` 映射 `user_id="all"`——
+  模块的 `must_at_bot` / `has_mention` 判定现在对 Matrix 生效
+
+### 修复
+
+- **接收侧音频段名纠正**：`m.audio` 产出段名由非标准的 `voice` 改为 OB12 标准的 `audio`（发送侧不受影响）
+- **API 响应 retcode 恒为 int**：Matrix 的 `errcode` 是字符串（如 `M_FORBIDDEN`），此前失败时被直接
+  填入 retcode 违反 OneBot12 返回码规范；现恒降级为 `34000`，原始 errcode 保留在 `message` 与 `matrix_raw`
+- 群组 API 动作参数名由 `room_id` 更正为规范的 `group_id`（`get_group_info` / `get_group_member_list` /
+  `leave_group` 等；关键字调用请改用 `group_id=`）
+- `get_group_member_list` 元素补齐 `user_name` / `user_displayname` 字段（此前仅有 `user_id`），
+  并过滤已退出/被封禁成员；`get_user_info` / `get_self_info` 补 `user_displayname`
+- matrix-nio 未安装时适配器导入崩溃（`NioSession` 类型注解在类定义期求值）——E2EE 缺失时
+  应回退明文模式而非抛 NameError
+
+### 兼容性说明
+
+- 依赖接收 `voice` 段名的模块请改判 `audio`（标准段名，与 Telegram 等适配器一致）
+- 以关键字调用群组 API（如 `get_group_info(room_id=...)`）请改为 `group_id=...`
+
+---
+
 ## [4.3.0] - 2026/10/04
 
 ### 新增

@@ -90,7 +90,8 @@ await matrix.Send.To("group", room_id).Text("Hello World!")
 ### 链式调用示例
 
 ```python
-# 基础发送
+# 基础发送（"user" 目标支持用户 ID（@user:server，自动反查 DM 房间）或房间 ID（!room:server））
+await matrix.Send.To("user", "@alice:matrix.org").Text("Hello")
 await matrix.Send.To("user", dm_room_id).Text("Hello")
 
 # 回复消息
@@ -132,6 +133,13 @@ ob12_msg = [
     {"type": "text", "data": {"text": "不错吧？"}}
 ]
 await matrix.Send.To("group", room_id).Raw_ob12(ob12_msg)
+
+# 位置消息（标准 location 段 → Matrix m.location；与文本共存时拆分为独立事件）
+ob12_msg = [
+    {"type": "text", "data": {"text": "我在这里"}},
+    {"type": "location", "data": {"latitude": 39.9, "longitude": 116.4, "title": "北京市"}}
+]
+await matrix.Send.To("group", room_id).Raw_ob12(ob12_msg)
 ```
 
 ## 发送方法返回值
@@ -154,9 +162,11 @@ await matrix.Send.To("group", room_id).Raw_ob12(ob12_msg)
 | retcode | 说明 |
 |---------|------|
 | 0 | 成功 |
+| 10002 | 不支持的动作（如 get_friend_list，Matrix 无好友概念） |
+| 10003 | 发送目标无效（无法解析为 Matrix 房间） |
 | 32000 | 请求超时或媒体上传失败 |
 | 33000 | API调用异常 |
-| 34000 | API返回了意外格式或业务错误 |
+| 34000 | API返回了意外格式或业务错误（Matrix errcode 保留在 message 与 matrix_raw） |
 
 ## 特有事件类型
 
@@ -240,10 +250,13 @@ Matrix消息根据 `msgtype` 自动转换为对应的消息段：
 | m.notice | `text` | 通知消息 |
 | m.emote | `text` | 动作消息 |
 | m.image | `image` | 图片消息 |
-| m.audio | `voice` | 音频消息 |
+| m.audio | `audio` | 音频消息 |
 | m.video | `video` | 视频消息 |
 | m.file | `file` | 文件消息 |
-| m.location | `location` | 位置消息 |
+| m.location | `location` | 位置消息（latitude/longitude 由 geo URI 解析） |
+
+> 提及（mention）：消息 content 中的 `m.mentions`（Matrix v1.11+ 规范）会转换为标准 `mention` 段——
+> `m.mentions.user_ids` → `mention(user_id=...)`，`m.mentions.room` → `mention(user_id="all")`。
 
 消息段结构示例：
 
@@ -273,12 +286,12 @@ Matrix消息根据 `msgtype` 自动转换为对应的消息段：
   }
 }
 
-// 位置消息
+// 位置消息（latitude/longitude 从 geo URI 解析）
 {
   "type": "location",
   "data": {
-    "latitude": 0.0,
-    "longitude": 0.0,
+    "latitude": 39.9,
+    "longitude": 116.4,
     "matrix_geo_uri": "geo:39.9,116.4",
     "text": "北京市"
   }

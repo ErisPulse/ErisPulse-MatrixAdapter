@@ -141,7 +141,7 @@ class NioSession:
 
         return self._convert_sync_response(resp)
 
-    def _convert_sync_response(self, resp: SyncResponse) -> dict:
+    def _convert_sync_response(self, resp: "SyncResponse") -> dict:
         """将 nio SyncResponse 转换为 REST /sync 的 dict 结构"""
         client = self._client
         join_rooms: Dict[str, dict] = {}
