@@ -69,3 +69,6 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          # 临时关闭 Sigstore 证明：Rekor 透明日志 500 故障期间无法出证，
+          # 恢复后改回 true 即可（不影响包内容与安装）
+          attestations: false
