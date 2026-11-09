@@ -6,8 +6,9 @@ MatrixAdapter 是基于 [Matrix协议](https://spec.matrix.org/) 构建的适配
 
 ## 文档信息
 
-- 对应模块版本: 4.3.0
+- 对应模块版本: 4.6.1
 - 维护者: ErisPulse
+- 最后更新: 2026-11-10
 
 ## 基本信息
 
@@ -49,15 +50,93 @@ enabled = true
 - `user_id`：Matrix用户ID（如 `@bot:matrix.org`），与 `password` 配合使用进行登录
 - `password`：Matrix用户密码，用于自动登录获取 access_token
 - `auto_accept_invites`：是否自动接受房间邀请，默认为 `true`
+- `enabled`：是否启用该账户（可选，默认为true）
 - `encryption_enabled`：是否启用端到端加密，默认为 `false`
 - `trust_all_devices`：是否自动信任未验证设备（E2EE），默认为 `true`
 - `device_id`：设备 ID（E2EE，通常自动获取，无需填写）
 - `store_path`：加密会话存储目录（E2EE），默认为 `data/matrix/<账户名>`
-- `enabled`：是否启用该账户（可选，默认为true）
 
 **认证方式：**
 - 方式一（推荐）：直接提供 `access_token`
 - 方式二：提供 `user_id` 和 `password`，适配器会自动调用登录接口获取 token
+
+## v5 范式更新（4.2.0）
+
+- **BaseConverter 继承**：转换器公共字段由框架 build_base_event 构建
+- **Api DSL**：get_self_info/get_user_info/get_group_info/get_group_list/get_group_member_list/leave_group/delete_message(redact) + 元动作
+- **消息事件补充 message_id**（event_id）；消息登记表支撑 delete_message
+- **spawn_background 任务归属**：同步/心跳任务改用 runtime.spawn_background
+- **框架软依赖**：运行时检测 ErisPulse>=2.7.1 并提示；启动输出版本日志
+- Matrix 无原生按钮能力，标准 keyboard 段优雅忽略（不报错）
+
+## 端到端加密（4.3.0）
+
+4.3.0 起适配器原生支持加密房间的端到端加密（基于 matrix-nio[e2e] / vodozemac）：
+
+```toml
+[Matrix_Adapter.accounts.default]
+user_id = "@bot:matrix.org"
+password = "YOUR_PASSWORD"
+encryption_enabled = true       # 启用（默认 false，存量部署不受影响）
+trust_all_devices = true        # 自动信任未验证设备（默认；false 为严格模式）
+```
+
+- 加密房间消息收发自动解密/加密，媒体端到端加密（`m.file.encrypted`）
+- `device_id` 自动解析与持久化；会话存储于 `store_path`（默认 `data/matrix/<账户名>`，**请勿删除**，否则历史消息无法解密）
+- 事件 Mixin 新增 `event.is_encrypted()`；媒体段携带 `matrix_encrypted_file`（JWK），可用 `MatrixAdapter.decrypt_media()` 解密
+- 不支持交叉签名与服务器端密钥备份；需要 Python >= 3.10
+- 未启用或未安装 matrix-nio 时自动降级为明文模式
+
+详细说明见下文[端到端加密（E2EE）](#端到端加密e2ee)章节与[适配器 README](https://github.com/ErisPulse/ErisPulse-MatrixAdapter)。
+
+## 标准化对齐
+
+本节说明适配器与 ErisPulse 标准化规范对齐的行为。规范详情参见 SDK 文档《API 响应规范》（`docs/zh-CN/standards/api-response.md`）与《发送方法规范》（`docs/zh-CN/standards/send-method-spec.md`）。
+
+### 多账户受理（4.6.1 起）
+
+- 所有事件注入 `self.account_id`（来源账户名）；access_token 登录账户在 `user_id` 为空时也能正确完成多账户受理与事件回路由
+
+### 错误码规范化（4.6.x）
+
+- **媒体上传/下载失败与请求超时统一 33001**（网络错误）
+- **平台 API 失败统一 34100**（平台错误），Matrix errcode 保留在 `message` 与 `matrix_raw` 字段
+- **撤回上下文缺失 10003**：`delete_message` 未找到消息归属上下文时返回参数错误
+
+| retcode | 说明 |
+|---------|------|
+| 0 | 成功 |
+| 10002 | 不支持的动作（如 get_friend_list，Matrix 无好友概念） |
+| 10003 | 发送目标无效（无法解析为 Matrix 房间）、撤回上下文缺失 |
+| 33001 | 网络错误（媒体上传/下载失败、请求超时） |
+| 34100 | 平台 API 失败（Matrix errcode 保留在 message 与 matrix_raw） |
+
+### Send 规范
+
+- Send 全方法读取 `send_context`：事件链内自动使用当前事件来源账户，显式 `Using()` 指定的账户优先
+- HTML 方法：`.Html(html, fallback)` 发送富文本消息；`HTML` 为规范拼写别名（`Html` 保留兼容既有模块）
+- `get_group_list` 返回每项补齐 `group_name` 字段（与 `get_group_info` 一致）
+
+### 标准Api动作示例
+
+```python
+from ErisPulse import sdk
+matrix = sdk.adapter.get("matrix")
+result = await matrix.Api.get_self_info()            # /account/whoami
+result = await matrix.Api.get_group_info(room_id)    # m.room.name
+result = await matrix.Api.get_group_list()           # /joined_rooms（每项含 group_name）
+await matrix.Api.delete_message(event_id)            # redact（登记表补全 room_id）
+```
+
+---
+
+### 已对接平台能力
+
+- **事件**：消息（m.room.message：文本/图片/文件/音视频/回复/编辑）、成员增减（m.room.member）、房间名称变更等状态事件
+- **会话**：私聊（DM 房间自动发现）/ 群组（房间）；发送支持 Text/Image/File/Voice/Video/Markdown/Raw_ob12
+- **API**：whoami/profile/joined_rooms/房间状态/成员列表/leave/redact（见上方 Api DSL）
+
+---
 
 ## 支持的消息发送类型
 
@@ -76,7 +155,8 @@ await matrix.Send.To("group", room_id).Text("Hello World!")
 - `.Video(file: bytes | str)`：发送视频消息，支持文件路径、URL、MXC URI、二进制数据。
 - `.File(file: bytes | str, filename: str = "")`：发送文件消息，支持文件路径、URL、MXC URI、二进制数据。
 - `.Notice(text: str)`：发送通知消息（Matrix的 m.notice 类型）。
-- `.Html(html: str, fallback: str = "")`：发送HTML格式消息，支持富文本内容。
+- `.Html(html: str, fallback: str = "")`：发送HTML格式消息，支持富文本内容（`HTML` 为规范拼写别名）。
+- `.MergeForward(nodes, title="合并聊天记录")`：发送合并转发消息（formatted_body blockquote 引用块形态；白名单会剥离 details/内联样式）。
 - `.Raw_ob12(message: List[Dict], **kwargs)`：发送 OneBot12 格式消息。
 
 ### 链式修饰方法（可组合使用）
@@ -92,7 +172,6 @@ await matrix.Send.To("group", room_id).Text("Hello World!")
 ```python
 # 基础发送（"user" 目标支持用户 ID（@user:server，自动反查 DM 房间）或房间 ID（!room:server））
 await matrix.Send.To("user", "@alice:matrix.org").Text("Hello")
-await matrix.Send.To("user", dm_room_id).Text("Hello")
 
 # 回复消息
 await matrix.Send.To("group", room_id).Reply("$event_id").Text("回复消息")
@@ -157,16 +236,7 @@ await matrix.Send.To("group", room_id).Raw_ob12(ob12_msg)
 }
 ```
 
-### 错误码说明
-
-| retcode | 说明 |
-|---------|------|
-| 0 | 成功 |
-| 10002 | 不支持的动作（如 get_friend_list，Matrix 无好友概念） |
-| 10003 | 发送目标无效（无法解析为 Matrix 房间） |
-| 32000 | 请求超时或媒体上传失败 |
-| 33000 | API调用异常 |
-| 34000 | API返回了意外格式或业务错误（Matrix errcode 保留在 message 与 matrix_raw） |
+错误码规范见上文[标准化对齐](#标准化对齐)章节。
 
 ## 特有事件类型
 
@@ -250,7 +320,7 @@ Matrix消息根据 `msgtype` 自动转换为对应的消息段：
 | m.notice | `text` | 通知消息 |
 | m.emote | `text` | 动作消息 |
 | m.image | `image` | 图片消息 |
-| m.audio | `audio` | 音频消息 |
+| m.audio | `audio` | 音频消息（标准消息段名为 `audio`；`voice` 是发送方法名，不是段名） |
 | m.video | `video` | 视频消息 |
 | m.file | `file` | 文件消息 |
 | m.location | `location` | 位置消息（latitude/longitude 由 geo URI 解析） |
@@ -467,3 +537,4 @@ async def handle_member_change(event):
         user_id = event.get("user_id")
         operator_id = event.get("operator_id")
         print(f"用户 {user_id} 被移除，操作者: {operator_id}")
+```

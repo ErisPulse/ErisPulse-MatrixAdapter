@@ -150,7 +150,7 @@ try:
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "4.6.0"
+__version__ = "4.6.1"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
@@ -335,6 +335,9 @@ class MatrixAdapter(BaseAdapter):
                 [{"type": "html", "data": {"html": html, "fallback": fallback}}]
             )
 
+        # 标准名别名（HTML 为规范拼写，Html 保留兼容既有模块）
+        HTML = Html
+
         def MergeForward(self, nodes, title: str = "合并聊天记录"):
             """发送合并转发消息（Matrix formatted_body：标题 + 每条 blockquote 引用块）
 
@@ -486,7 +489,7 @@ class MatrixAdapter(BaseAdapter):
                 mxc_uri, file_dict = await _upload_bytes(media_file)
                 if not mxc_uri:
                     return self._adapter.make_error(
-                        retcode=32000, message="媒体上传失败", raw=None
+                        retcode=33001, message="媒体上传失败", raw=None
                     )
                 content = self._build_media_content(
                     media_type,
@@ -511,7 +514,7 @@ class MatrixAdapter(BaseAdapter):
                 result = await self._adapter._download_file(account_name, media_file)
                 if not result:
                     return self._adapter.make_error(
-                        retcode=32000, message="媒体下载失败", raw=None
+                        retcode=33001, message="媒体下载失败", raw=None
                     )
                 file_bytes, download_ct = result
                 upload_ct = (
@@ -520,7 +523,7 @@ class MatrixAdapter(BaseAdapter):
                 mxc_uri, file_dict = await _upload_bytes(file_bytes, upload_ct)
                 if not mxc_uri:
                     return self._adapter.make_error(
-                        retcode=32000, message="媒体上传失败", raw=None
+                        retcode=33001, message="媒体上传失败", raw=None
                     )
                 mimetype = upload_ct
                 url_name = os.path.basename(unquote(urlparse(media_file).path))
@@ -558,7 +561,7 @@ class MatrixAdapter(BaseAdapter):
                     mxc_uri, file_dict = await _upload_bytes(resolved_bytes, guessed_type)
                     if not mxc_uri:
                         return self._adapter.make_error(
-                            retcode=32000, message="媒体上传失败", raw=None
+                            retcode=33001, message="媒体上传失败", raw=None
                         )
                     content = self._build_media_content(
                         media_type,
@@ -620,7 +623,7 @@ class MatrixAdapter(BaseAdapter):
                     self._adapter._get_logger().error(
                         i18n.t("matrix.e2ee_send_failed", name=account_name, error=err, default="账户 {name} 加密发送失败: {error}")
                     )
-                    return self._adapter.make_error(retcode=34000, message=err, raw=None)
+                    return self._adapter.make_error(retcode=34100, message=err, raw=None)
                 resp = self._adapter.make_response(
                     status="ok",
                     retcode=0,
@@ -900,7 +903,7 @@ class MatrixAdapter(BaseAdapter):
         """按消息登记表撤回消息（Matrix redact 需要 room_id + event_id）"""
         room_id = self._message_targets.get(message_id)
         if not room_id:
-            return self.make_error(retcode=34001, message=f"未找到消息 {message_id} 的目标上下文，无法撤回")
+            return self.make_error(retcode=10003, message=f"未找到消息 {message_id} 的目标上下文，无法撤回")
         import uuid as _uuid
 
         txn_id = _uuid.uuid4().hex
@@ -1365,6 +1368,7 @@ class MatrixAdapter(BaseAdapter):
                             self._message_targets[str(onebot_event["message_id"])] = str(room_id)
                             while len(self._message_targets) > 800:
                                 self._message_targets.pop(next(iter(self._message_targets)), None)
+                        onebot_event.setdefault("self", {})["account_id"] = account_name
                         await self.sdk.adapter.emit(onebot_event)
                 except Exception as e:
                     self.logger.error(i18n.t("matrix.process_event_failed", error=e, default="处理事件失败: {error}"))
@@ -1458,7 +1462,9 @@ class MatrixAdapter(BaseAdapter):
     async def call_api(
         self, endpoint: str, method: str = "POST", _account_id: str = None, **params
     ):
-        account_name, account = self._resolve_account(_account_id)
+                # 标准字段 account_id 与旧名 _account_id 双兼容（ApiDSL.Using 传标准名）
+        account_id = params.pop("account_id", None) or _account_id
+        account_name, account = self._resolve_account(account_id)
         homeserver = (account.homeserver or "https://matrix.org").rstrip("/")
         url = f"{homeserver}{endpoint}"
         # 优先使用运行时 token（密码登录后获得），避免 self.accounts 每次重新读取配置导致 token 丢失
@@ -1488,7 +1494,7 @@ class MatrixAdapter(BaseAdapter):
             if not isinstance(raw_response, dict):
                 response = self.make_response(
                     status="ok" if success else "failed",
-                    retcode=0 if success else 34000,
+                    retcode=0 if success else 34100,
                     data=raw_response,
                     message_id="",
                     message="",
@@ -1511,7 +1517,7 @@ class MatrixAdapter(BaseAdapter):
             errcode = raw_response.get("errcode", "")
             response = self.make_response(
                 status="ok" if success else "failed",
-                retcode=0 if success else 34000,
+                retcode=0 if success else 34100,
                 data=data,
                 message_id=message_id,
                 message=""
@@ -1530,7 +1536,7 @@ class MatrixAdapter(BaseAdapter):
 
         except asyncio.TimeoutError:
             self.logger.error(i18n.t("matrix.api_timeout", name=account_name, endpoint=endpoint, default="账户 {name} Matrix API 请求超时: {endpoint}"))
-            err = self.make_error(retcode=32000, message=i18n.t("matrix.timeout_msg", default="请求超时"), raw=None)
+            err = self.make_error(retcode=33001, message=i18n.t("matrix.timeout_msg", default="请求超时"), raw=None)
             if echo:
                 err["echo"] = echo
             return err
@@ -1637,7 +1643,7 @@ class MatrixAdapter(BaseAdapter):
             if r.get("status") != "ok":
                 return r
             rooms = (r.get("data") or {}).get("joined_rooms", []) or []
-            r["data"] = [{"group_id": str(x)} for x in rooms]
+            r["data"] = [{"group_id": str(x), "group_name": ""} for x in rooms]
             return r
 
         async def get_group_member_info(self, group_id: str, user_id: str) -> dict:
